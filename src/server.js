@@ -9,6 +9,20 @@ const path = require('path');
 // Cargar variables de entorno PRIMERO (independiente del cwd)
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
+// 🔥 VERIFICACIÓN CRÍTICA: Asegurar que DATABASE_URL está cargada en producción
+if (process.env.NODE_ENV === 'production') {
+  if (!process.env.DATABASE_URL) {
+    console.error('❌ ERROR CRÍTICO: DATABASE_URL no está definida en producción');
+    console.error('   Render debe inyectar esta variable automáticamente.');
+    console.error('   Verifica que esté configurada en Environment Variables.');
+    console.error('   La variable debe contener la Internal Database URL de PostgreSQL.');
+    process.exit(1);
+  }
+  console.log('✅ DATABASE_URL encontrada (modo producción)');
+}
+
+console.log(`🔌 Modo base de datos: ${process.env.DATABASE_URL ? '✅ Usando DATABASE_URL' : '⚠️ Usando variables separadas (modo desarrollo)'}`);
+
 const sequelize = require('./config/database');
 
 // Importar modelos e inicializar asociaciones (todo en uno, desde index.js)
@@ -86,6 +100,8 @@ app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'OK',
     timestamp: new Date().toISOString(),
+    database: process.env.DATABASE_URL ? 'configured' : 'not configured',
+    environment: process.env.NODE_ENV || 'development'
   });
 });
 
@@ -143,11 +159,18 @@ const startServer = async () => {
     const httpServer = http.createServer(app);
     initializeSocket(httpServer);
     httpServer.listen(PORT, () => {
-      console.log(`Servidor ejecutándose en http://localhost:${PORT}`);
-      console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`\n🚀 Servidor ejecutándose en puerto ${PORT}`);
+      console.log(`📍 Entorno: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`🗄️  Base de datos: ${process.env.DATABASE_URL ? 'PostgreSQL (Render)' : 'PostgreSQL (Local)'}`);
+      console.log(`✅ Health check: http://localhost:${PORT}/health\n`);
     });
   } catch (error) {
-    console.error('Error al iniciar el servidor:', error);
+    console.error('❌ Error al iniciar el servidor:', error);
+    console.error('\n🔍 Posibles causas:');
+    console.error('   1. DATABASE_URL no está configurada en las variables de entorno');
+    console.error('   2. La base de datos no está accesible (verificar región en Render)');
+    console.error('   3. La contraseña o credenciales son incorrectas');
+    console.error('   4. La base de datos no existe o está pausada');
     process.exit(1);
   }
 };
