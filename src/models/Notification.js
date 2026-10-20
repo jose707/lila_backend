@@ -30,8 +30,9 @@ const Notification = sequelize.define(
         'ride_accepted',
         'ride_cancelled',
         'payment',
-        'promo',
-        'system'
+        'system',
+        'emergency',
+        'panic'
       ),
       allowNull: false,
     },

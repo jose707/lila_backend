@@ -1,12 +1,146 @@
 // backend/src/controllers/requestController.js
 const Driver = require('../models/Driver');
+const Vehicle = require('../models/Vehicle');
 const DriverRequest = require('../models/DriverRequest');
 const RequestFile = require('../models/RequestFile');
 const User = require('../models/User');
+const UserIdentity = require('../models/UserIdentity');
 const fs = require('fs');
 const path = require('path');
+const sharp = require('sharp');
+const ocrService = require('../services/ocrService');
+const { cropForOcr } = require('../services/documentCrop');
+
+const toIsoDate = value => {
+  const match = String(value || '').trim().match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  return match ? `${match[3]}-${match[2]}-${match[1]}` : (value || null);
+};
+
+const REQUIRED_DRIVER_DOCUMENTS = [
+  'licenseFront', 'licenseBack',
+  'antecedentsPhoto', 'carFront', 'carBack',
+  'soatPhoto', 'ruatPhoto',
+];
+
+const isFutureOrToday = value => {
+  const iso = toIsoDate(value);
+  if (!iso) return false;
+  return new Date(`${iso}T23:59:59.999Z`) >= new Date();
+};
 
 const uploadDir = path.join(__dirname, '../uploads/drivers');
+
+/**
+ * Preprocesa la imagen para OCR: blanco y negro + estiramiento de contraste.
+ * Vision lee mejor en escala de grises con contraste normalizado.
+ */
+async function preprocessForOcr(buffer) {
+  try {
+    return await sharp(buffer).grayscale().normalize().toBuffer();
+  } catch (e) {
+    console.warn('No se pudo preprocesar la imagen para OCR:', e.message);
+    return buffer;
+  }
+}
+
+/**
+ * Extrae datos de una imagen de documento usando OCR.
+ * POST /requests/ocr-extract  (multipart: image + documentType + recorte opcional)
+ */
+const extractDocument = async (req, res) => {
+  try {
+    const documentType = req.body && req.body.documentType;
+    if (!Object.prototype.hasOwnProperty.call(ocrService.REQUIRED_BY_TYPE, documentType)) {
+      return res.status(400).json({
+        error: 'Se requiere el campo "documentType".',
+      });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: 'No se recibió ninguna imagen.' });
+    }
+
+
+    // Geometría del molde de la cámara (si el cliente la envió)
+    let cropRect = null;
+    if (req.body) {
+      const vals = [
+        'cropX',
+        'cropY',
+        'cropW',
+        'cropH',
+        'cropScreenW',
+        'cropScreenH',
+      ].map((f) => parseFloat(req.body[f]));
+      if (vals.every((v, index) => Number.isFinite(v) && (index < 2 ? v >= 0 : v > 0))) {
+        cropRect = {
+          x: vals[0],
+          y: vals[1],
+          w: vals[2],
+          h: vals[3],
+          screenW: vals[4],
+          screenH: vals[5],
+        };
+        const outside =
+          cropRect.x + cropRect.w > cropRect.screenW * 1.05 ||
+          cropRect.y + cropRect.h > cropRect.screenH * 1.05;
+        if (outside) cropRect = null;
+      }
+    }
+    const wantCrop =
+      cropRect ||
+      (req.body &&
+        (req.body.crop === '1' || req.body.crop === 'true' || req.body.crop === true));
+
+    let buffer = req.file.buffer;
+    // Rotate based on EXIF orientation so the image is upright for OCR.
+    // Sharp's .rotate() reads the EXIF 'orientation' tag and applies the
+    // correct transformation (90°, 270°, or flip) before any further processing.
+    buffer = await sharp(buffer, { limitInputPixels: 24000000 }).rotate().toBuffer();
+    if (wantCrop) buffer = await cropForOcr(buffer, cropRect, 0.05);
+    buffer = await preprocessForOcr(buffer);
+    buffer = await sharp(buffer).png().toBuffer();
+
+    // Vista previa (reducida) de exactamente lo que se envía a Vision
+    let previewBase64 = '';
+    try {
+      const preview = await sharp(buffer)
+        .resize({ width: 480, withoutEnlargement: true })
+        .jpeg({ quality: 70 })
+        .toBuffer();
+      previewBase64 = `data:image/jpeg;base64,${preview.toString('base64')}`;
+    } catch (e) {
+      console.warn('No se pudo generar la vista previa:', e.message);
+    }
+
+    const { fields, rawText, missing, facesFound, rejected, rejectReason, words, classify } =
+      await ocrService.extractDocument(buffer, documentType);
+
+    if (rejected && (documentType === 'ciFront' || documentType === 'ciBack')) {
+      console.log(
+        `[OCR] ${documentType} rechazado. Clasificación:`,
+        JSON.stringify(classify),
+      );
+    }
+
+    res.json({
+      documentType,
+      fields,
+      rawText,
+      missing,
+      facesFound,
+      rejected,
+      rejectReason,
+      words,
+      classify,
+      previewBase64,
+    });
+  } catch (error) {
+    console.error('Error extracting document:', error.name);
+    res.status(error.status || 500).json({
+      error: error.status ? error.message : 'No se pudo analizar la imagen. Intenta una nueva captura.',
+    });
+  }
+};
 
 /**
  * Register a new driver - creates first DriverRequest
@@ -27,7 +161,16 @@ const registerDriver = async (req, res) => {
     const {
       firstName,
       lastName,
+      fullName,
+      birthDate,
       ciNumber,
+      issueDate,
+      expiryDate,
+      birthPlace,
+      address,
+      occupation,
+      maritalStatus,
+      bloodType,
       antecedentsDate,
       vehicleType,
       vehiclePlate,
@@ -35,13 +178,83 @@ const registerDriver = async (req, res) => {
       vehicleColor,
       vehiclePassengerCapacity,
       licenseExpiryDate,
+      licenseCategory,
+      licenseNumber,
+      licenseIssueDate,
+      licenseNationality,
+      licenseGlasses,
+      licenseHearingAid,
       vehicleBrand,
       vehicleModel,
+      ocrData,
     } = req.body;
+
+    // Datos OCR por documento (para verificación del admin)
+    let ocr = {};
+    if (typeof ocrData === 'string' && ocrData.trim()) {
+      try {
+        ocr = JSON.parse(ocrData);
+      } catch (e) {
+        console.warn('⚠️ ocrData inválido, se ignora:', e.message);
+      }
+    }
+
+    // La licencia boliviana debe pertenecer a la misma persona que la CI.
+    const compactIdentity = value => String(value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^A-Za-z0-9 ]/g, ' ')
+      .toUpperCase()
+      .split(/\s+/)
+      .filter(Boolean)
+      .sort()
+      .join(' ');
+    const licenseOcr = ocr.licenseFront?.fields || {};
+    const licenseBackOcr = ocr.licenseBack?.fields || {};
+    const identity = await UserIdentity.findOne({ where: { userId } });
+    if (!identity || identity.verificationStatus !== 'verified') {
+      return res.status(400).json({ error: 'Debes verificar tu identidad con la cédula antes de solicitar ser conductor.' });
+    }
+    const officialName = [identity.firstNames, identity.paternalSurname, identity.maternalSurname]
+      .filter(Boolean).join(' ');
+    if (
+      !licenseOcr.licenseNumber || !licenseOcr.fullName || !licenseOcr.birthDate ||
+      licenseOcr.licenseNumber !== identity.ciNumber ||
+      compactIdentity(licenseOcr.fullName) !== compactIdentity(officialName) ||
+      toIsoDate(licenseOcr.birthDate) !== identity.birthDate
+    ) {
+      return res.status(400).json({
+        error: 'La licencia debe contener y coincidir con el número, nombre y fecha de nacimiento de la identidad verificada.',
+      });
+    }
+    if (licenseBackOcr.bloodType && identity.bloodType && licenseBackOcr.bloodType !== identity.bloodType) {
+      return res.status(400).json({ error: 'El grupo sanguíneo de la licencia no coincide con la cédula.' });
+    }
+    const ruatOcr = ocr.ruatPhoto?.fields || {};
+    const comparableCi = value => String(value || '').replace(/\D/g, '');
+    if (
+      !ruatOcr.vehicleOwnerName ||
+      !ruatOcr.vehicleOwnerCi ||
+      compactIdentity(ruatOcr.vehicleOwnerName) !== compactIdentity(officialName) ||
+      comparableCi(ruatOcr.vehicleOwnerCi) !== comparableCi(identity.ciNumber)
+    ) {
+      return res.status(400).json({ error: 'El nombre o CI del propietario del RUAT no coincide con la identidad verificada.' });
+    }
+    if (
+      licenseOcr.licenseNumber &&
+      licenseBackOcr.licenseNumber &&
+      (licenseOcr.licenseNumber !== licenseBackOcr.licenseNumber ||
+        licenseOcr.issueDate !== licenseBackOcr.issueDate ||
+        licenseOcr.licenseExpiryDate !== licenseBackOcr.licenseExpiryDate ||
+        licenseOcr.licenseCategory !== licenseBackOcr.licenseCategory)
+    ) {
+      return res.status(400).json({
+        error: 'Los datos del frente y reverso de la licencia no coinciden.',
+      });
+    }
 
     // Validate required fields
     if (
-      !ciNumber ||
       !vehicleType ||
       !vehiclePlate ||
       !vehicleYear ||
@@ -51,7 +264,7 @@ const registerDriver = async (req, res) => {
     ) {
       return res.status(400).json({
         error:
-          'Los datos del vehículo, licencia y cédula de identidad son requeridos.',
+          'Los datos del vehículo y licencia son requeridos.',
       });
     }
 
@@ -65,6 +278,23 @@ const registerDriver = async (req, res) => {
       });
     }
 
+    // Validar edad (fecha de nacimiento DD/MM/YYYY extraída por OCR)
+    if (birthDate) {
+      const [d, m, y] = birthDate.split('/').map(Number);
+      if (d && m && y) {
+        const b = new Date(y, m - 1, d);
+        const now = new Date();
+        let age = now.getFullYear() - b.getFullYear();
+        const mo = now.getMonth() - b.getMonth();
+        if (mo < 0 || (mo === 0 && now.getDate() < b.getDate())) age--;
+        if (age < 18) {
+          return res.status(400).json({
+            error: 'Debes ser mayor de 18 años para registrarte como conductor.',
+          });
+        }
+      }
+    }
+
     // Create first DriverRequest (version 1) - sin crear Driver aún
     const request = await DriverRequest.create({
       userId,
@@ -72,15 +302,37 @@ const registerDriver = async (req, res) => {
       version: 1,
       status: 'pending',
       metadata: {
-        ciNumber,
         vehicleType: normalizedVehicleType,
         vehiclePlate,
         vehicleYear,
         vehicleColor,
         vehiclePassengerCapacity,
         licenseExpiryDate,
+        licenseCategory: licenseCategory || undefined,
+        licenseNumber: licenseNumber || undefined,
+        licenseIssueDate: licenseIssueDate || undefined,
+        licenseNationality: licenseNationality || undefined,
+        licenseGlasses: licenseGlasses || undefined,
+        licenseHearingAid: licenseHearingAid || undefined,
         vehicleBrand,
         vehicleModel,
+        registrationMunicipality: ruatOcr.registrationMunicipality || undefined,
+        crpvaNumber: ruatOcr.crpvaNumber || undefined,
+        ruatIssueDate: ruatOcr.ruatIssueDate || undefined,
+        ownershipStartDate: ruatOcr.ownershipStartDate || undefined,
+        doorCount: ruatOcr.doorCount || undefined,
+        serviceType: ruatOcr.serviceType || undefined,
+        chassisNumber: ruatOcr.chassisNumber || undefined,
+        engineNumber: ruatOcr.engineNumber || undefined,
+        fuelType: ruatOcr.fuelType || undefined,
+        engineDisplacement: ruatOcr.engineDisplacement || undefined,
+        engineType: ruatOcr.engineType || undefined,
+        legalObservations: ruatOcr.legalObservations || undefined,
+        soatRosetteNumber: (ocr.soatPhoto?.fields || {}).soatRosetteNumber || undefined,
+        soatStartDate: (ocr.soatPhoto?.fields || {}).soatStartDate || undefined,
+        soatExpiryDate: (ocr.soatPhoto?.fields || {}).soatExpiryDate || undefined,
+        soatUse: (ocr.soatPhoto?.fields || {}).soatUse || undefined,
+        ocr,
       },
     });
 
@@ -91,16 +343,11 @@ const registerDriver = async (req, res) => {
         Object.keys(req.files),
       );
       const fileFields = [
-        'profilePhoto',
-        'ciFront',
-        'ciBack',
         'licenseFront',
         'licenseBack',
         'antecedentsPhoto',
         'carFront',
         'carBack',
-        'carLeft',
-        'carRight',
         'soatPhoto',
         'ruatPhoto',
       ];
@@ -146,21 +393,88 @@ const registerDriver = async (req, res) => {
       console.log('⚠️ NO FILES received in request');
     }
 
-    // Update user profile
-    const user = await User.findByPk(userId);
-    if (firstName || lastName) {
-      await user.update({
-        name: `${firstName || ''} ${lastName || ''}`.trim(),
+    // Decisión automática: no hay aprobación manual. El registro solo se
+    // habilita si los documentos requeridos, cruces OCR y vigencias son válidos.
+    const storedFiles = await RequestFile.findAll({ where: { requestId: request.id } });
+    const storedTypes = new Set(storedFiles.map(file => file.fileType));
+    const missingFiles = REQUIRED_DRIVER_DOCUMENTS.filter(type => !storedTypes.has(type));
+    const soatOcr = ocr.soatPhoto?.fields || {};
+    const automaticRejection =
+      missingFiles.length ? `Faltan documentos obligatorios: ${missingFiles.join(', ')}.` :
+      !isFutureOrToday(licenseOcr.licenseExpiryDate) ? 'La licencia de conducir está vencida o no tiene una fecha de vencimiento válida.' :
+      !isFutureOrToday(soatOcr.soatExpiryDate) ? 'El SOAT está vencido o no tiene una fecha de vencimiento válida.' :
+      soatOcr.soatUse !== 'PUBLICO' ? 'El SOAT debe indicar uso PUBLICO para registrar un vehículo de transporte.' :
+      '';
+
+    if (automaticRejection) {
+      await request.update({ status: 'rejected', rejectionReason: automaticRejection });
+      return res.status(422).json({
+        error: automaticRejection,
+        request: { id: request.id, version: request.version, status: 'rejected' },
       });
     }
 
+    await RequestFile.update(
+      { status: 'verified', verifiedAt: new Date() },
+      { where: { requestId: request.id } },
+    );
+
+    const driver = await Driver.create({
+      userId,
+      status: 'approved',
+      licenseNumber: licenseOcr.licenseNumber,
+      licenseNationality: licenseOcr.nationality || null,
+      licenseIssueDate: toIsoDate(licenseOcr.issueDate),
+      licenseExpiry: toIsoDate(licenseOcr.licenseExpiryDate),
+      licenseCategory: licenseOcr.licenseCategory || null,
+      licenseWearsGlasses: licenseBackOcr.glasses === 'Sí',
+      licenseUsesHearingAid: licenseBackOcr.hearingAid === 'Sí',
+      licenseVerificationStatus: 'verified',
+      licenseVerifiedAt: new Date(),
+      isAvailable: true,
+    });
+    const vehicle = await Vehicle.create({
+      driver_id: driver.id,
+      brand: ruatOcr.vehicleBrand,
+      model: ruatOcr.vehicleModel,
+      year: parseInt(ruatOcr.vehicleYear),
+      color: ruatOcr.vehicleColor,
+      plate: ruatOcr.vehiclePlate,
+      capacity: parseInt(ruatOcr.vehiclePassengerCapacity) || 4,
+      vehicle_type: normalizedVehicleType,
+      registrationMunicipality: ruatOcr.registrationMunicipality || null,
+      crpvaNumber: ruatOcr.crpvaNumber || null,
+      ruatIssueDate: toIsoDate(ruatOcr.ruatIssueDate),
+      ownershipStartDate: toIsoDate(ruatOcr.ownershipStartDate),
+      doorCount: parseInt(ruatOcr.doorCount) || null,
+      serviceType: ruatOcr.serviceType || null,
+      chassisNumber: ruatOcr.chassisNumber || null,
+      engineNumber: ruatOcr.engineNumber || null,
+      fuelType: ruatOcr.fuelType || null,
+      engineDisplacement: ruatOcr.engineDisplacement || null,
+      engineType: ruatOcr.engineType || null,
+      legalObservations: ruatOcr.legalObservations || null,
+      ruatVerified: true,
+      ruatVerifiedAt: new Date(),
+      soatRosetteNumber: soatOcr.soatRosetteNumber || null,
+      soatStartDate: toIsoDate(soatOcr.soatStartDate),
+      soatExpiryDate: toIsoDate(soatOcr.soatExpiryDate),
+      soatUse: soatOcr.soatUse,
+      soatVerificationStatus: 'verified',
+      soatVerifiedAt: new Date(),
+      status: 'active',
+    });
+    await request.update({ driverId: driver.id, status: 'approved' });
+
     res.status(201).json({
-      message: 'Solicitud de conductor creada correctamente',
+      message: 'Registro aprobado automáticamente.',
       request: {
         id: request.id,
         version: request.version,
         status: request.status,
       },
+      driver: { id: driver.id },
+      vehicle: { id: vehicle.id },
     });
   } catch (error) {
     console.error('Error registering driver:', error);
@@ -302,7 +616,7 @@ const resubmitDocuments = async (req, res) => {
     const previousApprovedFiles = await RequestFile.findAll({
       where: {
         requestId: latestRequest.id, // Esta es la versión anterior rechazada
-        status: 'approved',
+        status: 'verified',
       },
     });
 
@@ -322,8 +636,6 @@ const resubmitDocuments = async (req, res) => {
         'antecedentsPhoto',
         'carFront',
         'carBack',
-        'carLeft',
-        'carRight',
         'soatPhoto',
         'ruatPhoto',
       ];
@@ -386,7 +698,7 @@ const resubmitDocuments = async (req, res) => {
               filename: approvedFile.filename,
               fileSize: approvedFile.fileSize,
               mimeType: approvedFile.mimeType,
-              status: 'approved',
+              status: 'verified',
             },
           });
           if (!created) {
@@ -395,7 +707,7 @@ const resubmitDocuments = async (req, res) => {
               filename: approvedFile.filename,
               fileSize: approvedFile.fileSize,
               mimeType: approvedFile.mimeType,
-              status: 'approved',
+              status: 'verified',
             });
           }
           console.log(
@@ -435,4 +747,5 @@ module.exports = {
   registerDriver,
   getRequestStatus,
   resubmitDocuments,
+  extractDocument,
 };

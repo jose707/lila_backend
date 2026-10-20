@@ -58,25 +58,16 @@ module.exports = {
       `CREATE TYPE settlement_payment_method AS ENUM ('cash', 'qr', 'transfer');`,
     );
     await q(
-      `CREATE TYPE discount_type           AS ENUM ('percentage', 'fixed');`,
-    );
-    await q(
       `CREATE TYPE applicable_to           AS ENUM ('passenger', 'driver', 'both');`,
     );
     await q(
-      `CREATE TYPE notification_type       AS ENUM ('ride_request', 'ride_accepted', 'ride_cancelled', 'payment', 'promo', 'system', 'emergency');`,
+      `CREATE TYPE notification_type       AS ENUM ('ride_request', 'ride_accepted', 'ride_cancelled', 'payment', 'system', 'emergency', 'panic');`,
     );
     await q(
       `CREATE TYPE audit_action            AS ENUM ('INSERT', 'UPDATE', 'DELETE');`,
     );
     await q(
       `CREATE TYPE driver_request_status   AS ENUM ('pending', 'approved', 'rejected');`,
-    );
-    await q(
-      `CREATE TYPE request_file_type       AS ENUM ('profilePhoto', 'ciFront', 'ciBack', 'licenseFront', 'licenseBack', 'antecedentsPhoto', 'carFront', 'carBack', 'carLeft', 'carRight', 'soatPhoto', 'ruatPhoto');`,
-    );
-    await q(
-      `CREATE TYPE request_file_status     AS ENUM ('pending', 'approved', 'rejected');`,
     );
     await q(
       `CREATE TYPE ruat_required_reason    AS ENUM ('accident', 'vehicle_mismatch', 'suspension_reactivation', 'criminal_record');`,
@@ -96,7 +87,6 @@ module.exports = {
         id              UUID         PRIMARY KEY DEFAULT uuid_generate_v4(),
         firebase_uid    VARCHAR(255) NOT NULL UNIQUE,
         fcm_token       VARCHAR(255),
-        name            VARCHAR(255) NOT NULL,
         email           VARCHAR(255) UNIQUE,
         phone           VARCHAR(30)  UNIQUE,
         password        VARCHAR(255),
@@ -104,7 +94,7 @@ module.exports = {
         current_mode    VARCHAR(50),
         profile_photo   VARCHAR(500),
         is_active       BOOLEAN      NOT NULL DEFAULT true,
-        is_verified     BOOLEAN      NOT NULL DEFAULT false,
+        phone_verified  BOOLEAN      NOT NULL DEFAULT false,
         last_login      TIMESTAMPTZ,
         deleted_at      TIMESTAMPTZ,
         created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
@@ -117,14 +107,37 @@ module.exports = {
       CREATE TABLE drivers (
         id                UUID          PRIMARY KEY DEFAULT uuid_generate_v4(),
         user_id           UUID          NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
-        license_number    VARCHAR(100),
-        license_expiry    TIMESTAMPTZ,
+        license_number    VARCHAR(20) UNIQUE,
+        license_nationality VARCHAR(100),
+        license_issue_date DATE,
+        license_expiry    DATE,
+        license_category  VARCHAR(20),
+        license_wears_glasses BOOLEAN,
+        license_uses_hearing_aid BOOLEAN,
+        license_verification_status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (license_verification_status IN ('pending', 'verified', 'rejected')),
+        license_verified_at TIMESTAMPTZ,
         status            driver_status NOT NULL DEFAULT 'pending',
         is_available      BOOLEAN       NOT NULL DEFAULT false,
         rejection_reason  VARCHAR(500),
         deleted_at        TIMESTAMPTZ,
         created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
         updated_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    // Datos oficiales obtenidos de la cédula; una identidad por usuario.
+    await q(`
+      CREATE TABLE user_identities (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+        first_names VARCHAR(150) NOT NULL,
+        paternal_surname VARCHAR(100), maternal_surname VARCHAR(100),
+        ci_number VARCHAR(20) NOT NULL UNIQUE, birth_date DATE NOT NULL,
+        issue_date DATE, expiry_date DATE, birth_place VARCHAR(150),
+        address VARCHAR(255), occupation VARCHAR(150), marital_status VARCHAR(50), blood_type VARCHAR(5),
+        verification_status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (verification_status IN ('pending', 'verified', 'rejected')),
+        verified_at TIMESTAMPTZ, verified_by UUID REFERENCES users(id), rejection_reason TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
 
@@ -140,6 +153,18 @@ module.exports = {
         plate                 VARCHAR(20)           NOT NULL UNIQUE,
         capacity              INTEGER               NOT NULL DEFAULT 4,
         vehicle_type          vehicle_type          NOT NULL DEFAULT 'taxi',
+        registration_municipality VARCHAR(100),
+        crpva_number          VARCHAR(50),
+        ruat_issue_date       DATE,
+        ownership_start_date  DATE,
+        door_count            INTEGER,
+        service_type          VARCHAR(100),
+        chassis_number        VARCHAR(50),
+        engine_number         VARCHAR(50),
+        fuel_type             VARCHAR(100),
+        engine_displacement   VARCHAR(50),
+        engine_type           VARCHAR(100),
+        legal_observations    TEXT,
         status                vehicle_status        NOT NULL DEFAULT 'active',
         -- ── Verificación RUAT ──────────────────────────────────────────────
         -- ruat_file != NULL && ruat_verified = false → en revisión por admin
@@ -151,6 +176,12 @@ module.exports = {
         ruat_required         BOOLEAN               NOT NULL DEFAULT FALSE,
         ruat_required_reason  ruat_required_reason,
         ruat_required_at      TIMESTAMPTZ,
+        soat_rosette_number   VARCHAR(100),
+        soat_start_date       DATE,
+        soat_expiry_date      DATE,
+        soat_use              VARCHAR(20) CHECK (soat_use IN ('PUBLICO', 'PARTICULAR')),
+        soat_verification_status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (soat_verification_status IN ('pending', 'verified', 'rejected')),
+        soat_verified_at      TIMESTAMPTZ,
         deleted_at            TIMESTAMPTZ,
         created_at            TIMESTAMPTZ           NOT NULL DEFAULT NOW(),
         updated_at            TIMESTAMPTZ           NOT NULL DEFAULT NOW()
@@ -165,12 +196,14 @@ module.exports = {
         heading    DOUBLE PRECISION,
         speed      DOUBLE PRECISION,
         is_online  BOOLEAN   NOT NULL DEFAULT true,
+        location_recorded_at TIMESTAMPTZ,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
     await q(
       `CREATE INDEX idx_driver_locations_geo ON driver_locations USING GIST(location);`,
     );
+    await q(`CREATE INDEX driver_locations_geography_idx ON driver_locations USING GIST ((location::geography));`);
 
     // ─── DRIVER REQUESTS ──────────────────────────────────────────────────────
     await q(`
@@ -188,19 +221,27 @@ module.exports = {
       );
     `);
 
-    // ─── REQUEST FILES ────────────────────────────────────────────────────────
+    // Archivos vigentes: CI, licencia, antecedentes, RUAT, SOAT y fotos del vehículo.
     await q(`
-      CREATE TABLE request_files (
-        id           UUID                PRIMARY KEY DEFAULT uuid_generate_v4(),
-        request_id   UUID                NOT NULL REFERENCES driver_requests(id) ON DELETE CASCADE,
-        file_type    request_file_type   NOT NULL,
-        filename     VARCHAR(500)        NOT NULL,
-        mime_type    VARCHAR(100)        NOT NULL,
-        file_size    INTEGER             NOT NULL,
-        status       request_file_status NOT NULL DEFAULT 'pending',
-        uploaded_at  TIMESTAMPTZ         NOT NULL DEFAULT NOW()
+      CREATE TABLE documents (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        driver_request_id UUID REFERENCES driver_requests(id) ON DELETE CASCADE,
+        driver_id UUID REFERENCES drivers(id) ON DELETE CASCADE,
+        vehicle_id UUID REFERENCES vehicles(id) ON DELETE CASCADE,
+        document_type VARCHAR(40) NOT NULL CHECK (document_type IN ('ciFront', 'ciBack', 'profilePhoto', 'licenseFront', 'licenseBack', 'antecedentsPhoto', 'ruatPhoto', 'soatPhoto', 'carFront', 'carBack', 'carLeft', 'carRight')),
+        file_path VARCHAR(500) NOT NULL, original_filename VARCHAR(255), mime_type VARCHAR(100), file_size INTEGER,
+        ocr_data JSONB, issued_at DATE, expires_at DATE, is_current BOOLEAN NOT NULL DEFAULT TRUE,
+        verification_status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (verification_status IN ('pending', 'verified', 'rejected')),
+        verified_at TIMESTAMPTZ, verified_by UUID REFERENCES users(id), rejection_reason TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
+    await q('CREATE INDEX idx_documents_user_type ON documents(user_id, document_type);');
+    await q('CREATE INDEX idx_documents_request_type ON documents(driver_request_id, document_type);');
+    await q('CREATE UNIQUE INDEX unique_documents_request_type ON documents(driver_request_id, document_type) WHERE driver_request_id IS NOT NULL;');
+    await q('CREATE INDEX idx_documents_driver_type ON documents(driver_id, document_type);');
+    await q('CREATE INDEX idx_documents_vehicle_type ON documents(vehicle_id, document_type);');
 
     // ─── SERVICE AREAS ────────────────────────────────────────────────────────
     await q(`
@@ -223,23 +264,6 @@ module.exports = {
     await q(
       `CREATE INDEX idx_service_areas_active   ON service_areas(is_active);`,
     );
-
-    // ─── PROMO CODES ──────────────────────────────────────────────────────────
-    await q(`
-      CREATE TABLE promo_codes (
-        id              UUID          PRIMARY KEY DEFAULT uuid_generate_v4(),
-        code            VARCHAR(50)   NOT NULL UNIQUE,
-        discount_type   discount_type NOT NULL,
-        discount_value  DOUBLE PRECISION NOT NULL,
-        expires_at      TIMESTAMPTZ,
-        max_uses        INTEGER,
-        uses_count      INTEGER       NOT NULL DEFAULT 0,
-        is_active       BOOLEAN       NOT NULL DEFAULT true,
-        deleted_at      TIMESTAMPTZ,
-        created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
-        updated_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW()
-      );
-    `);
 
     // ─── CANCELLATION REASONS ─────────────────────────────────────────────────
     await q(`
@@ -275,9 +299,13 @@ module.exports = {
         distance                  DOUBLE PRECISION,
         duration                  INTEGER,
         service_area_id           UUID             REFERENCES service_areas(id),
-        promo_code_id             UUID             REFERENCES promo_codes(id),
         cancellation_reason_id    UUID             REFERENCES cancellation_reasons(id),
         cancelled_by              cancelled_by_type,
+        request_mode              TEXT NOT NULL DEFAULT 'negotiation',
+        request_key               TEXT,
+        pickup_distance           DOUBLE PRECISION,
+        pickup_duration           INTEGER,
+        pickup_surcharge          NUMERIC(10,2) NOT NULL DEFAULT 0,
         accepted_at               TIMESTAMPTZ,
         arrived_at                TIMESTAMPTZ,
         passenger_ready_at        TIMESTAMPTZ,
@@ -323,6 +351,43 @@ module.exports = {
     await q(
       `CREATE INDEX idx_ride_offers_ride_status ON ride_offers(ride_id, status);`,
     );
+
+    // ─── Asignación rápida y protección de conductores ocupados ──────────────
+    await q(`CREATE UNIQUE INDEX rides_request_key_unique ON rides(passenger_id, request_key) WHERE request_key IS NOT NULL;`);
+    await q(`
+      CREATE UNIQUE INDEX rides_one_busy_driver ON rides(driver_id)
+      WHERE deleted_at IS NULL AND driver_id IS NOT NULL AND
+        (status IN ('accepted','arrived','in_progress') OR (request_mode = 'quick_assignment' AND status = 'requested'));
+    `);
+    await q(`
+      CREATE UNIQUE INDEX rides_one_busy_passenger ON rides(passenger_id)
+      WHERE deleted_at IS NULL AND
+        (status IN ('accepted','arrived','in_progress') OR (request_mode = 'quick_assignment' AND status = 'requested'));
+    `);
+    await q(`
+      CREATE OR REPLACE FUNCTION guard_available_ride_offer() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.status IN ('pending', 'accepted') THEN
+          PERFORM 1 FROM drivers WHERE id = NEW.driver_id FOR UPDATE;
+          IF EXISTS (SELECT 1 FROM rides WHERE id = NEW.ride_id AND request_mode = 'quick_assignment') THEN
+            RAISE EXCEPTION 'La asignación rápida no admite ofertas' USING ERRCODE = '23514';
+          END IF;
+          IF EXISTS (
+            SELECT 1 FROM rides WHERE driver_id = NEW.driver_id AND deleted_at IS NULL
+              AND (status IN ('accepted','arrived','in_progress') OR
+                (request_mode = 'quick_assignment' AND status = 'requested' AND expires_at > clock_timestamp()))
+          ) THEN
+            RAISE EXCEPTION 'El conductor está ocupado o reservado' USING ERRCODE = '23514';
+          END IF;
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+    `);
+    await q(`
+      CREATE TRIGGER ride_offers_available_guard BEFORE INSERT OR UPDATE ON ride_offers
+      FOR EACH ROW EXECUTE FUNCTION guard_available_ride_offer();
+    `);
 
     // ─── PAYMENTS ─────────────────────────────────────────────────────────────
     await q(`
@@ -568,6 +633,27 @@ module.exports = {
     `);
     await q(`CREATE INDEX idx_recordings_alert ON emergency_recordings(alert_id);`);
 
+    // ─── RIDE WAYPOINTS (Paradas intermedias) ─────────────────────────────────
+    // Paradas intermedias de un viaje (rutas con múltiples destinos).
+    // Cada viaje puede tener 0 o más paradas ordenadas por secuencia.
+    await q(`
+      CREATE TABLE ride_waypoints (
+        id          UUID                 PRIMARY KEY DEFAULT uuid_generate_v4(),
+        ride_id     UUID                 NOT NULL REFERENCES rides(id) ON DELETE CASCADE,
+        sequence    SMALLINT             NOT NULL,
+        location    GEOMETRY(POINT, 4326) NOT NULL,
+        address     TEXT                 NOT NULL,
+        arrived_at  TIMESTAMPTZ,
+        departed_at TIMESTAMPTZ,
+        created_at  TIMESTAMPTZ          NOT NULL DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ,
+
+        CONSTRAINT uq_ride_waypoint UNIQUE (ride_id, sequence)
+      );
+    `);
+    await q(`CREATE INDEX idx_ride_waypoints_ride_id ON ride_waypoints(ride_id);`);
+    await q(`CREATE INDEX idx_ride_waypoints_geo     ON ride_waypoints USING GIST(location);`);
+
     // ─── TRIGGER: validar razón de cancelación ────────────────────────────────
     await q(`
       CREATE OR REPLACE FUNCTION check_cancellation_reason_match()
@@ -722,10 +808,9 @@ module.exports = {
     const bcrypt = require('bcryptjs');
     const adminPasswordHash = bcrypt.hashSync('admin123', 10);
     await q(`
-      INSERT INTO users (id, name, phone, email, password, role, firebase_uid, is_active, is_verified, created_at, updated_at)
+      INSERT INTO users (id, phone, email, password, role, firebase_uid, is_active, phone_verified, created_at, updated_at)
       VALUES (
         '00000000-0000-0000-0000-000000000001',
-        'Administrador',
         '+59169164016',
         'admin@linealila.com',
         '${adminPasswordHash}',
@@ -737,6 +822,49 @@ module.exports = {
         NOW()
       );
     `);
+
+    // ─── Seed: conductor de prueba para el acceso de desarrollo ───────────────
+    const testDriverPasswordHash = bcrypt.hashSync('Conductor123!', 10);
+    await q(`
+      INSERT INTO users (id, firebase_uid, phone, email, password, role, current_mode, is_active, phone_verified, created_at, updated_at)
+      VALUES (
+        '00000000-0000-0000-0000-000000000002',
+        'test-driver-seed',
+        '+59179990001',
+        'conductor.prueba@linealila.test',
+        '${testDriverPasswordHash}',
+        'driver',
+        'driver',
+        true,
+        true,
+        NOW(),
+        NOW()
+      );
+      INSERT INTO drivers (id, user_id, status, is_available, created_at, updated_at)
+      VALUES (
+        '00000000-0000-0000-0000-000000000002',
+        '00000000-0000-0000-0000-000000000002',
+        'approved',
+        false,
+        NOW(),
+        NOW()
+      );
+      INSERT INTO vehicles (id, driver_id, brand, model, year, color, plate, capacity, vehicle_type, status, created_at, updated_at)
+      VALUES (
+        '00000000-0000-0000-0000-000000000003',
+        '00000000-0000-0000-0000-000000000002',
+        'Prueba',
+        'Taxi',
+        2020,
+        'Blanco',
+        'TEST-0001',
+        4,
+        'taxi',
+        'active',
+        NOW(),
+        NOW()
+      );
+    `);
   },
 
   // ────────────────────────────────────────────────────────────────────────────
@@ -744,6 +872,7 @@ module.exports = {
     const q = sql => queryInterface.sequelize.query(sql);
 
     // Eliminar triggers y funciones
+    await q(`DROP FUNCTION IF EXISTS guard_available_ride_offer() CASCADE;`);
     await q(`DROP TRIGGER IF EXISTS validate_cancellation_reason ON rides;`);
     await q(`DROP FUNCTION IF EXISTS check_cancellation_reason_match CASCADE;`);
     await q(`DROP FUNCTION IF EXISTS generate_monthly_settlement CASCADE;`);
@@ -753,6 +882,7 @@ module.exports = {
     await q(`DROP FUNCTION IF EXISTS is_location_serviceable CASCADE;`);
 
     // Eliminar tablas en orden inverso (respetando FKs)
+    await q(`DROP TABLE IF EXISTS ride_waypoints        CASCADE;`);
     // — Módulo emergencias —
     await q(`DROP TABLE IF EXISTS emergency_recordings  CASCADE;`);
     await q(`DROP TABLE IF EXISTS emergency_sms_logs    CASCADE;`);
@@ -769,13 +899,13 @@ module.exports = {
     await q(`DROP TABLE IF EXISTS ride_offers            CASCADE;`);
     await q(`DROP TABLE IF EXISTS rides                  CASCADE;`);
     await q(`DROP TABLE IF EXISTS cancellation_reasons   CASCADE;`);
-    await q(`DROP TABLE IF EXISTS promo_codes            CASCADE;`);
     await q(`DROP TABLE IF EXISTS service_areas          CASCADE;`);
-    await q(`DROP TABLE IF EXISTS request_files          CASCADE;`);
     await q(`DROP TABLE IF EXISTS driver_requests        CASCADE;`);
+    await q(`DROP TABLE IF EXISTS documents              CASCADE;`);
     await q(`DROP TABLE IF EXISTS driver_locations       CASCADE;`);
     await q(`DROP TABLE IF EXISTS vehicles               CASCADE;`);
     await q(`DROP TABLE IF EXISTS drivers                CASCADE;`);
+    await q(`DROP TABLE IF EXISTS user_identities        CASCADE;`);
     await q(`DROP TABLE IF EXISTS users                  CASCADE;`);
 
     // Eliminar ENUMs
@@ -795,13 +925,10 @@ module.exports = {
       'commission_status',
       'settlement_status',
       'settlement_payment_method',
-      'discount_type',
       'applicable_to',
       'notification_type',
       'audit_action',
       'driver_request_status',
-      'request_file_type',
-      'request_file_status',
       'ruat_required_reason',
     ];
     for (const e of enumNames) {

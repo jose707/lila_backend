@@ -29,8 +29,19 @@ const initializeSocket = (httpServer) => {
     registerRideHandlers(io, socket);
     registerLocationHandlers(io, socket);
 
-    socket.on('disconnect', (reason) => {
+    socket.on('disconnect', async (reason) => {
       console.log(`🔌 [Socket] Disconnected: user=${userId} reason=${reason}`);
+      try {
+        // A second device/session may still be connected for this user.
+        const remaining = await io.in(`user:${userId}`).fetchSockets();
+        if (remaining.length === 0) {
+          const { Driver, DriverLocation } = require('../models');
+          const driver = await Driver.findOne({ where: { userId } });
+          if (driver) await DriverLocation.update({ is_online: false }, { where: { driver_id: driver.id } });
+        }
+      } catch (error) {
+        console.warn('Driver disconnect availability:', error.message);
+      }
     });
 
     socket.on('error', (err) => {

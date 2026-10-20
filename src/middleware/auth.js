@@ -21,10 +21,7 @@ const authMiddleware = (req, res, next) => {
     next();
   } catch (error) {
     console.error('❌ Error en autenticación:', error.message);
-    console.error(
-      '   Token parcial:',
-      req.headers.authorization?.substring(0, 50) + '...',
-    );
+
     res.status(401).json({
       error: 'Token inválido o expirado',
       message: error.message,

@@ -32,6 +32,13 @@ const Driver = sequelize.define(
       allowNull: true,
       field: 'license_expiry',
     },
+    licenseNationality: { type: DataTypes.STRING, allowNull: true, field: 'license_nationality' },
+    licenseIssueDate: { type: DataTypes.DATEONLY, allowNull: true, field: 'license_issue_date' },
+    licenseCategory: { type: DataTypes.STRING, allowNull: true, field: 'license_category' },
+    licenseWearsGlasses: { type: DataTypes.BOOLEAN, allowNull: true, field: 'license_wears_glasses' },
+    licenseUsesHearingAid: { type: DataTypes.BOOLEAN, allowNull: true, field: 'license_uses_hearing_aid' },
+    licenseVerificationStatus: { type: DataTypes.STRING, allowNull: false, defaultValue: 'pending', field: 'license_verification_status' },
+    licenseVerifiedAt: { type: DataTypes.DATE, allowNull: true, field: 'license_verified_at' },
     status: {
       type: DataTypes.ENUM('pending', 'approved', 'rejected', 'suspended'),
       defaultValue: 'pending',

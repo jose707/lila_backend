@@ -33,3 +33,10 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Service account keys
+*.json
+!aws/api-face-liveness/package.json
+
+# Fotos reales de pruebas (NO se suben al repo)
+dev-assets/

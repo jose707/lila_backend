@@ -74,9 +74,25 @@ const multerErrorHandler = (err, req, res, next) => {
 router.post(
   '/register',
   authMiddleware,
+  require('../middleware/verifiedIdentity'),
   uploadFields,
   multerErrorHandler,
   requestController.registerDriver,
+);
+
+const ocrUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1, fields: 10 },
+  fileFilter: (_req, file, cb) => cb(null, ['image/jpeg', 'image/png', 'image/jpg'].includes(file.mimetype)),
+});
+
+// Extraer datos de un documento con OCR (Cloud Vision)
+router.post(
+  '/ocr-extract',
+  authMiddleware,
+  ocrUpload.single('image'),
+  multerErrorHandler,
+  requestController.extractDocument,
 );
 
 // Get current request status
@@ -92,7 +108,7 @@ router.post(
 );
 
 // Serve files with anti-cache headers
-router.get('/file/:filename', (req, res) => {
+router.get('/file/:filename', authMiddleware, require('../middleware/documentAccess'), (req, res) => {
   const filename = req.params.filename;
   const filepath = path.join(uploadDir, filename);
 

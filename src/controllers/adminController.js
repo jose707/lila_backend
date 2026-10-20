@@ -1,5 +1,6 @@
 // backend/src/controllers/adminController.js
 const User = require('../models/User');
+const UserIdentity = require('../models/UserIdentity');
 const Driver = require('../models/Driver');
 const Vehicle = require('../models/Vehicle');
 const Ride = require('../models/Ride');
@@ -8,6 +9,11 @@ const DriverRequest = require('../models/DriverRequest');
 const RequestFile = require('../models/RequestFile');
 const sequelize = require('../config/database');
 const { Op } = require('sequelize');
+
+const toIsoDate = value => {
+  const match = String(value || '').trim().match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  return match ? `${match[3]}-${match[2]}-${match[1]}` : (value || null);
+};
 
 const getAllUsers = async (req, res) => {
   try {
@@ -18,10 +24,20 @@ const getAllUsers = async (req, res) => {
     whereClause.isActive = inactive === 'true' ? false : true;
 
     if (search) {
+      const matchingIdentities = await UserIdentity.findAll({
+        attributes: ['userId'],
+        where: {
+          [Op.or]: [
+            { firstNames: { [Op.iLike]: `%${search}%` } },
+            { paternalSurname: { [Op.iLike]: `%${search}%` } },
+            { maternalSurname: { [Op.iLike]: `%${search}%` } },
+          ],
+        },
+      });
       whereClause[Op.or] = [
-        { name: { [Op.iLike]: `%${search}%` } },
         { email: { [Op.iLike]: `%${search}%` } },
         { phone: { [Op.iLike]: `%${search}%` } },
+        { id: { [Op.in]: matchingIdentities.map(identity => identity.userId) } },
       ];
     }
 
@@ -32,6 +48,7 @@ const getAllUsers = async (req, res) => {
     const users = await User.findAll({
       where: whereClause,
       attributes: { exclude: ['password'] },
+      include: [{ model: UserIdentity, as: 'identity', attributes: ['firstNames', 'paternalSurname', 'maternalSurname'] }],
       limit: parseInt(limit),
       offset: parseInt(offset),
       order: [['createdAt', 'DESC']],
@@ -39,8 +56,14 @@ const getAllUsers = async (req, res) => {
 
     const total = await User.count({ where: whereClause });
 
+    const mappedUsers = users.map(user => {
+      const plain = user.toJSON();
+      plain.name = [plain.identity?.firstNames, plain.identity?.paternalSurname, plain.identity?.maternalSurname]
+        .filter(Boolean).join(' ');
+      return plain;
+    });
     res.status(200).json({
-      users,
+      users: mappedUsers,
       total,
       limit: parseInt(limit),
       offset: parseInt(offset),
@@ -180,8 +203,16 @@ const getAllDrivers = async (req, res) => {
 };
 
 const approveDriver = async (req, res) => {
+  return res.status(403).json({
+    error: 'La aprobación es automática. El administrador solo puede consultar el resultado.',
+  });
+};
+
+// Se conserva temporalmente como referencia de migración; no está expuesto por rutas.
+const approveDriverManuallyDisabled = async (req, res) => {
   try {
     const { requestId } = req.params;
+    const { verifiedDocuments } = req.body;
 
     // Obtener la solicitud del conductor
     const request = await DriverRequest.findByPk(requestId);
@@ -208,21 +239,44 @@ const approveDriver = async (req, res) => {
 
     // Obtener los datos del vehículo de metadata
     const metadata = request.metadata || {};
-    // Detectar si el RUAT fue enviado y aprobado en esta solicitud
-    const ruatFile = await RequestFile.findOne({
-      where: {
-        requestId: request.id,
-        fileType: 'ruatPhoto',
-        status: 'approved',
-      },
-    });
+    const identity = await UserIdentity.findOne({ where: { userId } });
+    if (!identity || identity.verificationStatus !== 'verified') {
+      return res.status(400).json({ error: 'La identidad oficial del conductor no está verificada.' });
+    }
+    const requiredDocuments = ['profilePhoto', 'ciFront', 'ciBack', 'licenseFront', 'licenseBack', 'antecedentsPhoto', 'carFront', 'carBack', 'carLeft', 'carRight', 'soatPhoto', 'ruatPhoto'];
+    if (!Array.isArray(verifiedDocuments)) {
+      return res.status(400).json({ error: 'Debes indicar los documentos revisados antes de aprobar.' });
+    }
+    const verifiedTypes = [...new Set(verifiedDocuments.filter(type => requiredDocuments.includes(type)))];
+    const missingReview = requiredDocuments.filter(type => !verifiedTypes.includes(type));
+    if (missingReview.length) {
+      return res.status(400).json({ error: `Faltan documentos por verificar: ${missingReview.join(', ')}.` });
+    }
+    const uploadedFiles = await RequestFile.findAll({ where: { requestId: request.id } });
+    const uploadedTypes = new Set(uploadedFiles.map(file => file.fileType));
+    const missingFiles = requiredDocuments.filter(type => !uploadedTypes.has(type));
+    if (missingFiles.length) {
+      return res.status(400).json({ error: `Faltan archivos obligatorios: ${missingFiles.join(', ')}.` });
+    }
+    await RequestFile.update(
+      { status: 'verified', verifiedAt: new Date(), verifiedBy: req.user.id },
+      { where: { requestId: request.id, fileType: verifiedTypes } },
+    );
+    const ruatFile = uploadedFiles.find(file => file.fileType === 'ruatPhoto');
 
     // Crear el Driver con los datos de la solicitud
     const driver = await Driver.create({
       userId,
       status: 'approved',
-      licenseNumber: metadata.ciNumber,
-      licenseExpiry: new Date(new Date().getFullYear() + 1, 0, 1),
+      licenseNumber: metadata.licenseNumber,
+      licenseNationality: metadata.licenseNationality || null,
+      licenseIssueDate: toIsoDate(metadata.licenseIssueDate),
+      licenseExpiry: toIsoDate(metadata.licenseExpiryDate),
+      licenseCategory: metadata.licenseCategory || null,
+      licenseWearsGlasses: metadata.licenseGlasses === 'true',
+      licenseUsesHearingAid: metadata.licenseHearingAid === 'true',
+      licenseVerificationStatus: verifiedTypes.includes('licenseFront') && verifiedTypes.includes('licenseBack') ? 'verified' : 'pending',
+      licenseVerifiedAt: new Date(),
       isAvailable: true,
     });
 
@@ -242,9 +296,27 @@ const approveDriver = async (req, res) => {
       plate: metadata.vehiclePlate || `TEMP-${driver.id.slice(0, 6)}`,
       capacity: parseInt(metadata.vehicleCapacity) || 4,
       vehicle_type: vType,
+      registrationMunicipality: metadata.registrationMunicipality || null,
+      crpvaNumber: metadata.crpvaNumber || null,
+      ruatIssueDate: toIsoDate(metadata.ruatIssueDate),
+      ownershipStartDate: toIsoDate(metadata.ownershipStartDate),
+      doorCount: parseInt(metadata.doorCount) || null,
+      serviceType: metadata.serviceType || null,
+      chassisNumber: metadata.chassisNumber || null,
+      engineNumber: metadata.engineNumber || null,
+      fuelType: metadata.fuelType || null,
+      engineDisplacement: metadata.engineDisplacement || null,
+      engineType: metadata.engineType || null,
+      legalObservations: metadata.legalObservations || null,
       status: 'active',
+      soatRosetteNumber: metadata.soatRosetteNumber || null,
+      soatStartDate: toIsoDate(metadata.soatStartDate),
+      soatExpiryDate: toIsoDate(metadata.soatExpiryDate),
+      soatUse: metadata.soatUse || null,
+      soatVerificationStatus: verifiedTypes.includes('soatPhoto') ? 'verified' : 'pending',
+      soatVerifiedAt: new Date(),
       // Si el conductor envió el RUAT y fue aprobado, el vehículo queda verificado
-      ruat_verified: !!ruatFile,
+      ruat_verified: !!ruatFile && verifiedTypes.includes('ruatPhoto'),
       ruat_verified_at: ruatFile ? new Date() : null,
     });
 
@@ -254,12 +326,6 @@ const approveDriver = async (req, res) => {
 
     // Asociar el driver a la solicitud
     await request.update({ driverId: driver.id, status: 'approved' });
-
-    // Marcar todos los archivos como aprobados
-    await RequestFile.update(
-      { status: 'approved' },
-      { where: { requestId: request.id } },
-    );
 
     // ── Notificar al conductor ────────────────────────────────────────────
     const { notify } = require('../services/notificationService');
@@ -288,6 +354,12 @@ const approveDriver = async (req, res) => {
 };
 
 const rejectDriver = async (req, res) => {
+  return res.status(403).json({
+    error: 'El rechazo es automático. El administrador solo puede consultar el resultado.',
+  });
+};
+
+const rejectDriverManuallyDisabled = async (req, res) => {
   try {
     const { driverId, requestId } = req.params;
     const { reason } = req.body;
@@ -390,7 +462,7 @@ const rejectDriver = async (req, res) => {
       }
     }
 
-    // Marcar todos los documentos NO rechazados como 'approved'
+    // Marcar todos los documentos NO rechazados como 'verified'
     // Lista explícita para evitar duplicados por las variantes de capitalizado
     const allDocumentTypes = [
       'profilePhoto',
@@ -409,7 +481,7 @@ const rejectDriver = async (req, res) => {
     for (const docType of allDocumentTypes) {
       if (!rejectedDocumentsKeys.includes(docType)) {
         await RequestFile.update(
-          { status: 'approved' },
+          { status: 'verified' },
           {
             where: {
               requestId: request.id,
@@ -475,10 +547,11 @@ const getPendingDriverRequests = async (req, res) => {
     // Para cada solicitud, obtener datos del usuario y archivos
     const requestsWithDetails = await Promise.all(
       pendingRequests.map(async request => {
-        // Obtener usuario
+        // El nombre se lee de la CI verificada, no de users.
         const user = await User.findByPk(request.userId, {
           attributes: { exclude: ['password'] },
         });
+        const identity = await UserIdentity.findOne({ where: { userId: request.userId } });
 
         // Obtener archivos de esta solicitud
         const requestFiles = await RequestFile.findAll({
@@ -501,10 +574,10 @@ const getPendingDriverRequests = async (req, res) => {
 
         return {
           id: request.id,
-          name: user?.name || '',
+          name: [identity?.firstNames, identity?.paternalSurname, identity?.maternalSurname].filter(Boolean).join(' '),
           email: user?.email || '',
           phone: user?.phone || '',
-          licenseNumber: request.metadata?.ciNumber || '',
+          licenseNumber: request.metadata?.licenseNumber || '',
           licenseExpiryDate: new Date(
             new Date().getFullYear() + 1,
             0,
@@ -514,7 +587,7 @@ const getPendingDriverRequests = async (req, res) => {
           vehiclePlate: request.metadata?.vehiclePlate || '',
           vehicleYear: request.metadata?.vehicleYear || 0,
           documentsVerified: Object.values(files).every(
-            f => f.status === 'approved',
+            f => f.status === 'verified',
           ),
           backgroundCheckPassed: false,
           backgroundCheckDate: request.createdAt?.toISOString() || '',
@@ -578,7 +651,8 @@ const getAllRides = async (req, res) => {
         {
           model: User,
           as: 'passenger',
-          attributes: ['id', 'name', 'email', 'phone'],
+          attributes: ['id', 'email', 'phone'],
+          include: [{ model: UserIdentity, as: 'identity', attributes: ['firstNames', 'paternalSurname', 'maternalSurname'] }],
         },
         {
           // Ride → Driver (not User). Nest User inside Driver to get name/phone.
@@ -589,7 +663,8 @@ const getAllRides = async (req, res) => {
             {
               model: User,
               as: 'user',
-              attributes: ['id', 'name', 'email', 'phone'],
+              attributes: ['id', 'email', 'phone'],
+              include: [{ model: UserIdentity, as: 'identity', attributes: ['firstNames', 'paternalSurname', 'maternalSurname'] }],
             },
           ],
         },
@@ -604,10 +679,15 @@ const getAllRides = async (req, res) => {
     // Flatten driver.user into a simpler shape for the frontend
     const mapped = rides.map(r => {
       const plain = r.toJSON();
+      if (plain.passenger) {
+        plain.passenger.name = [plain.passenger.identity?.firstNames, plain.passenger.identity?.paternalSurname, plain.passenger.identity?.maternalSurname]
+          .filter(Boolean).join(' ');
+      }
       if (plain.driver && plain.driver.user) {
         plain.driver = {
           id: plain.driver.user.id,
-          name: plain.driver.user.name,
+          name: [plain.driver.user.identity?.firstNames, plain.driver.user.identity?.paternalSurname, plain.driver.user.identity?.maternalSurname]
+            .filter(Boolean).join(' '),
           email: plain.driver.user.email,
           phone: plain.driver.user.phone,
         };
@@ -676,35 +756,6 @@ const getAnalytics = async (req, res) => {
     res.status(500).json({
       error: 'Error al obtener las análiticas',
       detail: error.message,
-    });
-  }
-};
-
-const createPromoCode = async (req, res) => {
-  try {
-    const { code, discountPercentage, discountAmount, maxUses, expiryDate } =
-      req.body;
-
-    if (!code) {
-      return res.status(400).json({
-        error: 'Código promocional requerido',
-      });
-    }
-
-    res.status(201).json({
-      message: 'Código promocional creado',
-      promoCode: {
-        code,
-        discountPercentage,
-        discountAmount,
-        maxUses,
-        expiryDate,
-      },
-    });
-  } catch (error) {
-    console.error('Error al crear código promocional:', error);
-    res.status(500).json({
-      error: 'Error al crear código promocional',
     });
   }
 };
@@ -809,6 +860,12 @@ const enableUser = async (req, res) => {
  * POST /admin/vehicles/:vehicleId/approve-ruat
  */
 const approveVehicleRuat = async (req, res) => {
+  return res.status(403).json({
+    error: 'La verificación del RUAT es automática. El administrador solo puede consultar el resultado.',
+  });
+};
+
+const approveVehicleRuatManuallyDisabled = async (req, res) => {
   try {
     const { vehicleId } = req.params;
 
@@ -832,7 +889,7 @@ const approveVehicleRuat = async (req, res) => {
       });
       if (latestRequest) {
         await RequestFile.update(
-          { status: 'approved' },
+          { status: 'verified' },
           { where: { requestId: latestRequest.id, fileType: 'ruatPhoto' } },
         );
       }
@@ -882,6 +939,12 @@ const approveVehicleRuat = async (req, res) => {
  * body: { reason: string }
  */
 const rejectVehicleRuat = async (req, res) => {
+  return res.status(403).json({
+    error: 'El rechazo del RUAT es automático. El administrador solo puede consultar el resultado.',
+  });
+};
+
+const rejectVehicleRuatManuallyDisabled = async (req, res) => {
   try {
     const { vehicleId } = req.params;
     const { reason } = req.body;
@@ -1279,8 +1342,8 @@ const getUserSegmentation = async (req, res) => {
     const admins     = await User.count({ where: { role: 'admin' } });
     const active     = await User.count({ where: { isActive: true } });
     const inactive   = await User.count({ where: { isActive: false } });
-    const verified   = await User.count({ where: { isVerified: true } });
-    const unverified = await User.count({ where: { isVerified: false } });
+    const verified   = await User.count({ where: { phoneVerified: true } });
+    const unverified = await User.count({ where: { phoneVerified: false } });
 
     res.json({
       byRole: { passengers, drivers, admins },
@@ -1388,7 +1451,6 @@ module.exports = {
   getRideFunnel,
   getUnitEconomics,
   getTopRoutes,
-  createPromoCode,
   deleteDriver,
   deleteUser,
   enableUser,

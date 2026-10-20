@@ -3,6 +3,7 @@
 // Loaded once from index.js — do NOT call sequelize.define() here.
 
 const User                = require('./User');
+const UserIdentity        = require('./UserIdentity');
 const Driver              = require('./Driver');
 const Ride                = require('./Ride');
 const RideOffer           = require('./RideOffer');
@@ -13,13 +14,13 @@ const DriverLocation      = require('./DriverLocation');
 const DriverRequest       = require('./DriverRequest');
 const RequestFile         = require('./RequestFile');
 const Notification        = require('./Notification');
-const PromoCode           = require('./PromoCode');
 const CancellationReason  = require('./CancellationReason');
 const DriverEarning       = require('./DriverEarning');
 const CommissionSettlement = require('./CommissionSettlement');
 const ServiceArea         = require('./ServiceArea');
 const PricingRule         = require('./PricingRule');
 const AuditLog            = require('./AuditLog');
+const RideWaypoint        = require('./RideWaypoint');
 
 const setupAssociations = () => {
 
@@ -28,6 +29,8 @@ const setupAssociations = () => {
   // ─────────────────────────────────────────
   User.hasOne(Driver, { foreignKey: 'userId', as: 'driverProfile' });
   Driver.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+  User.hasOne(UserIdentity, { foreignKey: 'userId', as: 'identity', onDelete: 'CASCADE' });
+  UserIdentity.belongsTo(User, { foreignKey: 'userId', as: 'user' });
 
   // ─────────────────────────────────────────
   // USER ↔ RIDE (as passenger)
@@ -62,7 +65,8 @@ const setupAssociations = () => {
   DriverRequest.belongsTo(User, { foreignKey: 'userId' });
 
   // ─────────────────────────────────────────
-  // DRIVER REQUEST ↔ REQUEST FILE
+  // DRIVER REQUEST ↔ DOCUMENTS
+  // RequestFile es el modelo de compatibilidad que usa la tabla documents.
   // ─────────────────────────────────────────
   DriverRequest.hasMany(RequestFile, { foreignKey: 'requestId', onDelete: 'CASCADE' });
   RequestFile.belongsTo(DriverRequest, { foreignKey: 'requestId' });
@@ -100,12 +104,6 @@ const setupAssociations = () => {
   Notification.belongsTo(User, { foreignKey: 'user_id', as: 'user' });
 
   // ─────────────────────────────────────────
-  // PROMO CODE ↔ RIDE
-  // ─────────────────────────────────────────
-  PromoCode.hasMany(Ride, { foreignKey: 'promo_code_id', as: 'rides' });
-  Ride.belongsTo(PromoCode, { foreignKey: 'promo_code_id', as: 'promoCode' });
-
-  // ─────────────────────────────────────────
   // CANCELLATION REASON ↔ RIDE
   // ─────────────────────────────────────────
   CancellationReason.hasMany(Ride, { foreignKey: 'cancellation_reason_id', as: 'rides' });
@@ -138,6 +136,13 @@ const setupAssociations = () => {
   // ─────────────────────────────────────────
   User.hasMany(AuditLog, { foreignKey: 'changed_by', as: 'auditLogs' });
   AuditLog.belongsTo(User, { foreignKey: 'changed_by', as: 'changedBy' });
+
+  // ─────────────────────────────────────────
+  // RIDE ↔ RIDE WAYPOINT (paradas intermedias)
+  // ─────────────────────────────────────────
+  Ride.hasMany(RideWaypoint, { foreignKey: 'ride_id', as: 'waypoints', onDelete: 'CASCADE' });
+  RideWaypoint.belongsTo(Ride, { foreignKey: 'ride_id', as: 'ride' });
+
 };
 
 module.exports = setupAssociations;

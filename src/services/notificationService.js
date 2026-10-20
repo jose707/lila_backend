@@ -6,7 +6,7 @@
  * usuario tiene un fcm_token registrado.
  *
  * Tipos válidos (según ENUM):
- *   'ride_request' | 'ride_accepted' | 'ride_cancelled' | 'payment' | 'promo' | 'system'
+ *   'ride_request' | 'ride_accepted' | 'ride_cancelled' | 'payment' | 'system' | 'emergency' | 'panic'
  */
 const { Notification, User } = require('../models');
 const { getFirebaseApp }     = require('../config/firebase');
@@ -55,7 +55,7 @@ async function sendPush(fcmToken, title, body, data = {}) {
  * @param {string}  opts.userId
  * @param {string}  opts.title
  * @param {string}  opts.body
- * @param {string}  opts.type   - ENUM: ride_request|ride_accepted|ride_cancelled|payment|promo|system
+ * @param {string}  opts.type   - ENUM: ride_request|ride_accepted|ride_cancelled|payment|system|emergency|panic
  * @param {object} [opts.data]
  */
 async function notify({ userId, title, body, type, data = null }) {

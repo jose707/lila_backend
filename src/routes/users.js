@@ -5,6 +5,7 @@ const userController = require('../controllers/userController');
 const { authMiddleware } = require('../middleware/auth');
 
 router.get('/profile', authMiddleware, userController.getUserProfile);
+router.get('/:id/profile-photo', authMiddleware, userController.getVerifiedProfilePhoto);
 router.get('/:id', authMiddleware, userController.getUserProfile);
 router.put('/:id', authMiddleware, userController.updateUserProfile);
 router.put('/:id/photo', authMiddleware, userController.updateProfilePhoto);

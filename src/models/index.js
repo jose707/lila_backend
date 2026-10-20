@@ -6,6 +6,7 @@ const sequelize           = require('../config/database');
 const setupAssociations   = require('./associations');
 
 const User                = require('./User');
+const UserIdentity        = require('./UserIdentity');
 const Driver              = require('./Driver');
 const Ride                = require('./Ride');
 const RideOffer           = require('./RideOffer');
@@ -16,13 +17,13 @@ const DriverLocation      = require('./DriverLocation');
 const DriverRequest       = require('./DriverRequest');
 const RequestFile         = require('./RequestFile');
 const Notification        = require('./Notification');
-const PromoCode           = require('./PromoCode');
 const CancellationReason  = require('./CancellationReason');
 const DriverEarning       = require('./DriverEarning');
 const CommissionSettlement = require('./CommissionSettlement');
 const ServiceArea         = require('./ServiceArea');
 const PricingRule         = require('./PricingRule');
 const AuditLog            = require('./AuditLog');
+const RideWaypoint        = require('./RideWaypoint');
 
 // Wire all associations in one call
 setupAssociations();
@@ -30,6 +31,7 @@ setupAssociations();
 module.exports = {
   sequelize,
   User,
+  UserIdentity,
   Driver,
   Ride,
   RideOffer,
@@ -40,11 +42,11 @@ module.exports = {
   DriverRequest,
   RequestFile,
   Notification,
-  PromoCode,
   CancellationReason,
   DriverEarning,
   CommissionSettlement,
   ServiceArea,
   PricingRule,
   AuditLog,
+  RideWaypoint,
 };

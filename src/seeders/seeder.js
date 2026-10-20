@@ -29,7 +29,7 @@ const seedDatabase = async () => {
       // Campos requeridos por el esquema normalizado
       firebaseUid: 'admin-seed-firebase-uid',
       isActive: true,
-      isVerified: true,
+      phoneVerified: true,
       currentMode: 'passenger',
       profilePhoto: null,
     });

@@ -9,6 +9,8 @@ const Driver = require('../models/Driver');
 const Ride = require('../models/Ride');
 const DriverRequest = require('../models/DriverRequest');
 const RequestFile = require('../models/RequestFile');
+const UserIdentity = require('../models/UserIdentity');
+const Vehicle = require('../models/Vehicle');
 
 // Importar asociaciones
 const setupAssociations = require('../models/associations');
@@ -34,7 +36,9 @@ const syncDatabase = async () => {
     console.log('  - drivers');
     console.log('  - rides');
     console.log('  - driver_requests');
-    console.log('  - request_files');
+    console.log('  - user_identities');
+    console.log('  - vehicles');
+    console.log('  - documents');
 
     process.exit(0);
   } catch (error) {

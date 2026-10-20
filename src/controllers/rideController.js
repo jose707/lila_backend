@@ -36,26 +36,48 @@ async function calcRating(id, role) {
 const Ride = require('../models/Ride');
 const User = require('../models/User');
 const Driver = require('../models/Driver');
-const PromoCode = require('../models/PromoCode');
 const DriverEarning = require('../models/DriverEarning');
+const RideWaypoint = require('../models/RideWaypoint');
+const RideOffer = require('../models/RideOffer');
 const { Op } = require('sequelize');
 const { sequelize } = require('../models');
 const { v4: uuidv4 } = require('uuid');
 const { getIO } = require('../socket');
 
 const createRide = async (req, res) => {
+  if (req.body.requestMode === 'quick_assignment') {
+    return require('./quickAssignmentController').reserve(req, res);
+  }
+  if (req.body.requestMode && req.body.requestMode !== 'negotiation') {
+    return res.status(400).json({ error: 'Modo de solicitud inválido.' });
+  }
   try {
+    const currentQuick = await require('../services/quickAssignmentService').current(req.user.id);
+    if (currentQuick) return res.status(409).json({ error: 'Ya tienes una reserva o viaje activo.' });
     const {
       pickupLocation,
       dropoffLocation,
+      waypoints,
       distance,
       duration,
       fare,
       vehicleTypeRequested,
       paymentMethod,
-      promoCode,
     } = req.body;
     const passengerId = req.user.id;
+
+    // Cancelar cualquier solicitud activa previa del pasajero
+    const activeRides = await Ride.findAll({
+      where: { passengerId, status: ['requested', 'offered'] },
+    });
+    for (const active of activeRides) {
+      await active.update({
+        status: 'cancelled',
+        cancelledAt: new Date(),
+        cancelledBy: 'passenger',
+        cancelReason: 'Nueva solicitud creada',
+      });
+    }
 
     // ── Validar coordenadas ────────────────────────────────────────────
     if (
@@ -82,6 +104,20 @@ const createRide = async (req, res) => {
       return res
         .status(400)
         .json({ error: 'Faltan datos requeridos: distance, duration' });
+    }
+
+    // ── Validar waypoints (paradas intermedias) ────────────────────────
+    let validatedWaypoints = [];
+    if (waypoints && Array.isArray(waypoints) && waypoints.length > 0) {
+      for (let i = 0; i < waypoints.length; i++) {
+        const wp = waypoints[i];
+        if (!wp?.latitude || !wp?.longitude || !wp?.address) {
+          return res.status(400).json({
+            error: `waypoint[${i}] inválido. Debe tener latitude, longitude y address`,
+          });
+        }
+      }
+      validatedWaypoints = waypoints;
     }
 
     const finalDistance = parseFloat(distance);
@@ -145,48 +181,7 @@ const createRide = async (req, res) => {
       totalFare = Math.round(totalFare); // opcional
     }
 
-    // ── Aplicar código de descuento ───────────────────────────────────
-    let discountAmount = 0;
-    let promoCodeId = null;
-
-    if (promoCode) {
-      const promo = await PromoCode.findOne({
-        where: {
-          code: promoCode.toUpperCase(),
-          is_active: true,
-          [Op.or]: [
-            { expires_at: null },
-            { expires_at: { [Op.gt]: new Date() } },
-          ],
-          [Op.or]: [
-            { max_uses: null },
-            { max_uses: { [Op.gt]: sequelize.col('uses_count') } },
-          ],
-        },
-      });
-
-      if (!promo) {
-        return res.status(400).json({
-          error: 'Código de descuento inválido, expirado o agotado.',
-          code: 'INVALID_PROMO',
-        });
-      }
-
-      discountAmount =
-        promo.discount_type === 'percentage'
-          ? Math.round(totalFare * (promo.discount_value / 100) * 100) / 100
-          : Math.min(promo.discount_value, totalFare);
-
-      promoCodeId = promo.id;
-
-      // Incrementar uses_count
-      await promo.increment('uses_count');
-    }
-
-    const finalFare = Math.max(
-      0,
-      Math.round((totalFare - discountAmount) * 100) / 100,
-    );
+    const finalFare = Math.max(0, Math.round(totalFare * 100) / 100);
 
     // ── Crear el viaje ────────────────────────────────────────────────
     const ride = await Ride.create({
@@ -212,19 +207,32 @@ const createRide = async (req, res) => {
       farePerKm,
       farePerMinute,
       totalFare,
-      discountAmount,
+      discountAmount: 0,
       finalFare,
       service_area_id: serviceAreaId,
-      promo_code_id: promoCodeId,
       status: 'requested',
       expiresAt: new Date(Date.now() + 2 * 60 * 1000),
     });
+
+    // ── Persistir waypoints (paradas intermedias) ─────────────────────
+    if (validatedWaypoints.length > 0) {
+      const waypointRecords = validatedWaypoints.map((wp, idx) => ({
+        ride_id: ride.id,
+        sequence: idx + 1,
+        location: {
+          type: 'Point',
+          coordinates: [parseFloat(wp.longitude), parseFloat(wp.latitude)],
+        },
+        address: wp.address,
+      }));
+      await RideWaypoint.bulkCreate(waypointRecords);
+    }
 
     console.log('✅ [createRide] Viaje creado:', {
       id: ride.id,
       zona: serviceArea?.name ?? 'Sin zona',
       tarifa: `Bs ${finalFare}`,
-      descuento: discountAmount > 0 ? `Bs ${discountAmount}` : 'ninguno',
+      waypoints: validatedWaypoints.length,
     });
 
     // 🔌 Notificar conductores cercanos de forma no-bloqueante
@@ -243,13 +251,13 @@ const createRide = async (req, res) => {
                AND d.status = 'approved'
                AND d.id NOT IN (
                  SELECT driver_id FROM rides
-                 WHERE status IN ('accepted', 'arrived', 'in_progress')
+                 WHERE (status IN ('accepted', 'arrived', 'in_progress') OR (request_mode = 'quick_assignment' AND status = 'requested'))
                    AND driver_id IS NOT NULL
                )
                AND ST_DWithin(
                  dl.location::geography,
                  ST_GeomFromText('POINT(${lng} ${lat})', 4326)::geography,
-                 5000
+                 3000
                )`,
             { type: sequelize.QueryTypes.SELECT },
           ),
@@ -281,7 +289,13 @@ const createRide = async (req, res) => {
             longitude: parseFloat(dropoffLocation.longitude),
             address: dropoffLocation.address,
           },
+          waypoints: validatedWaypoints.map(wp => ({
+            latitude: parseFloat(wp.latitude),
+            longitude: parseFloat(wp.longitude),
+            address: wp.address,
+          })),
           createdAt: ride.createdAt,
+          expiresAt: ride.expiresAt,
         };
 
         const io = getIO();
@@ -323,6 +337,12 @@ const getRideById = async (req, res) => {
 
       ride = await Ride.findByPk(id, {
         include: [
+          {
+            model: RideWaypoint,
+            as: 'waypoints',
+            required: false,
+            order: [['sequence', 'ASC']],
+          },
           {
             model: User,
             as: 'passenger',
@@ -439,6 +459,7 @@ const getRideById = async (req, res) => {
       ? {
         latitude: driverLoc.location.coordinates?.[1] ?? 0,
         longitude: driverLoc.location.coordinates?.[0] ?? 0,
+        heading: driverLoc.heading ?? null,
       }
       : null;
 
@@ -459,6 +480,18 @@ const getRideById = async (req, res) => {
         enrichedRide.dropoffLocation,
         ride.dropoff_address,
       ),
+      // Waypoints normalizados
+      waypoints: (enrichedRide.waypoints || []).map(wp => ({
+        id: wp.id,
+        sequence: wp.sequence,
+        location: {
+          latitude: wp.location?.coordinates?.[1] ?? 0,
+          longitude: wp.location?.coordinates?.[0] ?? 0,
+        },
+        address: wp.address,
+        arrivedAt: wp.arrived_at || null,
+        departedAt: wp.departed_at || null,
+      })),
       // Conductor normalizado (alias user → User para compatibilidad con frontend)
       driver: enrichedRide.driver
         ? {
@@ -494,15 +527,18 @@ const getRideById = async (req, res) => {
 const getActiveRide = async (req, res) => {
   try {
     const userId = req.user.id;
+    await require('../services/quickAssignmentService').expireReservations();
+    const activeDriver = await Driver.findOne({ where: { userId } });
 
     let activeRide;
     try {
       activeRide = await Ride.findOne({
         where: {
-          [Op.or]: [{ passengerId: userId }, { driverId: userId }],
-          status: {
-            [Op.in]: ['requested', 'accepted', 'in_progress'],
-          },
+          [Op.or]: [{ passengerId: userId }, ...(activeDriver ? [{ driverId: activeDriver.id }] : [])],
+          [Op.and]: [{ [Op.or]: [
+            { status: { [Op.in]: ['accepted', 'arrived', 'in_progress'] } },
+            { requestMode: 'negotiation', status: { [Op.in]: ['requested', 'offered'] }, expiresAt: { [Op.gt]: new Date() } },
+          ] }],
         },
         include: [
           {
@@ -532,10 +568,11 @@ const getActiveRide = async (req, res) => {
       // Retornar viaje sin Driver si hay error
       activeRide = await Ride.findOne({
         where: {
-          [Op.or]: [{ passengerId: userId }, { driverId: userId }],
-          status: {
-            [Op.in]: ['requested', 'accepted', 'in_progress'],
-          },
+          [Op.or]: [{ passengerId: userId }, ...(activeDriver ? [{ driverId: activeDriver.id }] : [])],
+          [Op.and]: [{ [Op.or]: [
+            { status: { [Op.in]: ['accepted', 'arrived', 'in_progress'] } },
+            { requestMode: 'negotiation', status: { [Op.in]: ['requested', 'offered'] }, expiresAt: { [Op.gt]: new Date() } },
+          ] }],
         },
       });
     }
@@ -579,6 +616,7 @@ const getRideHistory = async (req, res) => {
       },
       include: [
         { model: User, as: 'passenger', attributes: { exclude: ['password'] } },
+        { model: RideWaypoint, as: 'waypoints', attributes: ['sequence', 'address'], required: false },
         {
           model: Driver,
           as: 'driver',
@@ -672,7 +710,9 @@ const acceptRide = async (req, res) => {
       {
         where: {
           id: rideId,
-          status: 'requested', // ← Validar AQUÍ en la actualización
+          status: 'requested',
+          requestMode: 'negotiation',
+          expiresAt: { [Op.gt]: new Date() },
         },
       },
     );
@@ -803,7 +843,7 @@ const acceptRide = async (req, res) => {
     console.error('❌ [acceptRide] Error al aceptar viaje:', error);
     console.error('❌ [acceptRide] Stack trace:', error.stack);
     console.error('❌ [acceptRide] Error message:', error.message);
-    res.status(500).json({
+    res.status(error.status || (['23505', '23514', '40P01'].includes(error.original?.code) ? 409 : 500)).json({
       error: 'Error al aceptar el viaje',
       details: error.message,
     });
@@ -1033,7 +1073,8 @@ const completeRide = async (req, res) => {
       try {
         const COMMISSION_RATE = parseFloat(process.env.COMMISSION_RATE ?? '0');
         const gross = parseFloat(ride.finalFare ?? 0);
-        const commissionAmt = Math.round(gross * COMMISSION_RATE * 100) / 100;
+        const commissionBase = Math.max(0, gross - Number(ride.pickupSurcharge || 0));
+        const commissionAmt = Math.round(commissionBase * COMMISSION_RATE * 100) / 100;
         const netAmt = Math.round((gross - commissionAmt) * 100) / 100;
 
         // Detectar si ya existe (evitar duplicados si completeRide se llama dos veces)
@@ -1050,7 +1091,7 @@ const completeRide = async (req, res) => {
             payment = await Payment.create({
               rideId: ride.id,
               passengerId: ride.passengerId,
-              amount: parseFloat(ride.totalFare ?? 0),
+              amount: parseFloat(ride.finalFare ?? 0),
               currency: 'BOB',
               payment_method: ride.paymentMethod || 'cash',
               payment_status: 'completed',
@@ -1122,6 +1163,12 @@ const completeRide = async (req, res) => {
 
 const getRideRequests = async (req, res) => {
   try {
+    if (await require('../services/quickAssignmentService').current(req.user.id, true)) return res.json([]);
+    const requestingDriver = await Driver.findOne({
+      where: { userId: req.user.id },
+      attributes: ['id'],
+    });
+    if (!requestingDriver) return res.json([]);
     console.log(
       '📡 [getRideRequests] Buscando solicitudes de viajes pendientes...',
     );
@@ -1131,9 +1178,17 @@ const getRideRequests = async (req, res) => {
     // Otros conductores pueden seguir enviando ofertas mientras el ride esté en estos estados
     const rides = await Ride.findAll({
       where: {
+        requestMode: 'negotiation',
         status: ['requested', 'offered'],
+        expiresAt: { [Op.gt]: new Date() },
       },
       include: [
+        {
+          model: RideWaypoint,
+          as: 'waypoints',
+          required: false,
+          order: [['sequence', 'ASC']],
+        },
         {
           model: User,
           as: 'passenger',
@@ -1143,12 +1198,23 @@ const getRideRequests = async (req, res) => {
       order: [['createdAt', 'DESC']], // Ordenar por más recientes
     });
 
-    console.log('📡 [getRideRequests] Viajes encontrados:', rides.length);
+    const rejectedOffers = rides.length ? await RideOffer.findAll({
+      where: {
+        driver_id: requestingDriver.id,
+        ride_id: { [Op.in]: rides.map(ride => ride.id) },
+        status: 'rejected',
+      },
+      attributes: ['ride_id'],
+    }) : [];
+    const rejectedRideIds = new Set(rejectedOffers.map(offer => offer.ride_id));
+    const visibleRides = rides.filter(ride => !rejectedRideIds.has(ride.id));
+
+    console.log('📡 [getRideRequests] Viajes visibles:', visibleRides.length);
 
     // ── Calcular ratings de pasajeros en batch (1 query) ─────────────────
     // Rating por defecto = 5 para usuarios nuevos sin valoraciones
     const passengerIds = [
-      ...new Set(rides.map(r => r.passengerId).filter(Boolean)),
+      ...new Set(visibleRides.map(r => r.passengerId).filter(Boolean)),
     ];
     const passengerRatingsMap = {};
 
@@ -1161,7 +1227,7 @@ const getRideRequests = async (req, res) => {
     }
 
     // Transformar la respuesta a un formato más limpio
-    const rideRequests = rides.map((ride, index) => {
+    const rideRequests = visibleRides.map((ride, index) => {
       const transformed = {
         rideId: ride.id,
         passengerName: ride.passenger?.name || 'Pasajero desconocido',
@@ -1190,11 +1256,24 @@ const getRideRequests = async (req, res) => {
             0,
           address: ride.dropoff_address || '',
         },
+        waypoints: (ride.waypoints || []).map(wp => ({
+          latitude:
+            wp.location?.coordinates?.[1] ??
+            wp.location?.latitude ??
+            0,
+          longitude:
+            wp.location?.coordinates?.[0] ??
+            wp.location?.longitude ??
+            0,
+          address: wp.address || '',
+          sequence: wp.sequence,
+        })),
         fare: ride.totalFare || ride.finalFare,
         distance: ride.distance,
         duration: ride.duration,
         notes: ride.notes || '',
-        createdAt: ride.createdAt, // 🔥 AGREGAR TIMESTAMP DEL SERVIDOR
+        createdAt: ride.createdAt,
+        expiresAt: ride.expiresAt,
       };
 
       // 🔥 DEBUG: Log cada viaje devuelto
@@ -1520,6 +1599,7 @@ const startRide = async (req, res) => {
 // 💰 CONTRA-OFERTAS DE TARIFA
 
 const submitCounterOffer = async (req, res) => {
+  const clockReceivedAt = new Date().toISOString();
   try {
     const { rideId } = req.params;
     const { proposedPrice } = req.body;
@@ -1570,20 +1650,48 @@ const submitCounterOffer = async (req, res) => {
         .json({ error: 'El viaje ya fue aceptado o cancelado' });
     }
 
+    if (ride.expiresAt && new Date(ride.expiresAt) <= new Date()) {
+      return res.status(410).json({ error: 'La solicitud ya expiró' });
+    }
+
+    const rejectedOffer = await RideOffer.findOne({
+      where: { ride_id: rideId, driver_id: driver.id, status: 'rejected' },
+      attributes: ['id'],
+    });
+    if (rejectedOffer) {
+      return res.status(409).json({
+        error: 'El pasajero rechazó tu oferta para esta solicitud.',
+        code: 'OFFER_REJECTED',
+      });
+    }
+
+    const offerExpiresAt = () => new Date(Math.min(
+      Date.now() + 60 * 1000,
+      ride.expiresAt ? new Date(ride.expiresAt).getTime() : Infinity,
+    ));
+
     // Evitar oferta duplicada activa del mismo conductor
     const existing = await RideOffer.findOne({
       where: { ride_id: rideId, driver_id: driver.id, status: 'pending' },
     });
     if (existing) {
       // Actualizar precio de la oferta existente
-      await existing.update({
-        offered_price: proposedPrice,
-        expires_at: new Date(Date.now() + 30 * 1000),
-      });
+      const [updatedCount] = await RideOffer.update(
+        { offered_price: proposedPrice, expires_at: offerExpiresAt() },
+        { where: { id: existing.id, status: 'pending' } },
+      );
+      if (!updatedCount) {
+        return res.status(409).json({
+          error: 'La oferta ya fue procesada y no puede actualizarse.',
+          code: 'OFFER_REJECTED',
+        });
+      }
+      await existing.reload();
       const vehicle = driver.vehicles?.[0] || null;
       const driverRating = await calcRating(driver.id, 'driver');
       return res.status(200).json({
         message: 'Oferta actualizada',
+        serverClock: { receivedAt: clockReceivedAt, sentAt: new Date().toISOString() },
         offer: {
           offerId: existing.id,
           driverId: driver.id,
@@ -1612,7 +1720,7 @@ const submitCounterOffer = async (req, res) => {
       driver_id: driver.id,
       offered_price: proposedPrice,
       status: 'pending',
-      expires_at: new Date(Date.now() + 30 * 1000),
+      expires_at: offerExpiresAt(),
     });
 
     // Cambiar estado del viaje a 'offered' si aún estaba en 'requested'
@@ -1646,6 +1754,7 @@ const submitCounterOffer = async (req, res) => {
             driverRating,
             createdAt: offer.createdAt,
             expiresAt: offer.expires_at,
+            timeLeftInSeconds: Math.max(0, Math.ceil((new Date(offer.expires_at).getTime() - Date.now()) / 1000)),
           },
         });
     } catch (socketError) {
@@ -1657,6 +1766,7 @@ const submitCounterOffer = async (req, res) => {
 
     res.status(201).json({
       message: 'Oferta enviada',
+      serverClock: { receivedAt: clockReceivedAt, sentAt: new Date().toISOString() },
       offer: {
         offerId: offer.id,
         driverId: driver.id,
@@ -1675,15 +1785,15 @@ const submitCounterOffer = async (req, res) => {
   } catch (error) {
     console.error('❌ [submitCounterOffer] Error:', error);
     res
-      .status(500)
+      .status(error.status || (['23505', '23514', '40P01'].includes(error.original?.code) ? 409 : 500))
       .json({ error: 'Error al enviar contra-oferta', details: error.message });
   }
 };
 
 const getCounterOffers = async (req, res) => {
+  const clockReceivedAt = new Date().toISOString();
   try {
     const { rideId } = req.params;
-    const now = Date.now();
 
     const { RideOffer } = require('../models');
     const Vehicle = require('../models/Vehicle');
@@ -1753,9 +1863,10 @@ const getCounterOffers = async (req, res) => {
         const vehicle = driver?.vehicles?.[0] || null;
         const driverRating = await calcRating(driver?.id, 'driver');
 
+        const now = Date.now();
         const expiresAt = o.expires_at
           ? new Date(o.expires_at).getTime()
-          : now + 30000;
+          : now + 60000;
         const timeLeftInSeconds = Math.max(
           0,
           Math.floor((expiresAt - now) / 1000),
@@ -1775,6 +1886,7 @@ const getCounterOffers = async (req, res) => {
           licensePlate: vehicle?.plate || '',
           proposedPrice: parseFloat(o.offered_price),
           createdAt: o.createdAt,
+          expiresAt: o.expires_at,
           timeLeftInSeconds,
           isExpired: timeLeftInSeconds === 0,
           rejected: false,
@@ -1790,6 +1902,7 @@ const getCounterOffers = async (req, res) => {
       offers,
       rideId: ride.id,
       originalFare: ride.finalFare,
+      serverClock: { receivedAt: clockReceivedAt, sentAt: new Date().toISOString() },
     });
   } catch (error) {
     console.error('❌ [getCounterOffers] Error:', error);
@@ -1831,32 +1944,18 @@ const acceptCounterOffer = async (req, res) => {
       });
     }
 
-    // Buscar la oferta seleccionada en ride_offers
-    const selectedOffer = await RideOffer.findOne({
-      where: { id: offerId, ride_id: rideId, status: 'pending' },
-    });
-
-    if (!selectedOffer) {
-      return res
-        .status(404)
-        .json({ error: 'Oferta no encontrada o ya procesada' });
-    }
-
-    // Aceptar la oferta seleccionada
-    await selectedOffer.update({ status: 'accepted' });
-
-    // Rechazar todas las demás ofertas pendientes del mismo viaje
-    await RideOffer.update(
-      { status: 'rejected' },
-      { where: { ride_id: rideId, status: 'pending' } },
-    );
-
-    // Actualizar el viaje con el conductor y precio final
-    await ride.update({
-      driverId: selectedOffer.driver_id,
-      finalFare: finalPrice ?? parseFloat(selectedOffer.offered_price),
-      status: 'accepted',
-      acceptedAt: new Date(),
+    const selectedOffer = await sequelize.transaction(async transaction => {
+      const lockedRide = await Ride.findByPk(rideId, { transaction, lock: transaction.LOCK.UPDATE });
+      if (lockedRide.requestMode !== 'negotiation' || !['requested', 'offered'].includes(lockedRide.status) || new Date(lockedRide.expiresAt) <= new Date()) {
+        throw Object.assign(new Error('La solicitud ya no está disponible.'), { status: 409 });
+      }
+      const offer = await RideOffer.findOne({ where: { id: offerId, ride_id: rideId, status: 'pending', expires_at: { [Op.gt]: new Date() } }, transaction });
+      if (!offer) throw Object.assign(new Error('La oferta ya no está disponible.'), { status: 409 });
+      await Driver.findByPk(offer.driver_id, { transaction, lock: transaction.LOCK.UPDATE });
+      await offer.update({ status: 'accepted' }, { transaction });
+      await lockedRide.update({ driverId: offer.driver_id, finalFare: Number(offer.offered_price), status: 'accepted', acceptedAt: new Date() }, { transaction });
+      await RideOffer.update({ status: 'rejected' }, { where: { ride_id: rideId, status: 'pending' }, transaction });
+      return offer;
     });
 
     // Recargar con asociaciones
@@ -1908,7 +2007,7 @@ const acceptCounterOffer = async (req, res) => {
     res.status(200).json({ message: 'Oferta aceptada', ride: updatedRide });
   } catch (error) {
     console.error('❌ [acceptCounterOffer] Error:', error);
-    res.status(500).json({
+    res.status(error.status || (['23505', '23514', '40P01'].includes(error.original?.code) ? 409 : 500)).json({
       error: 'Error al aceptar contra-oferta',
       details: error.message,
     });
@@ -2021,6 +2120,10 @@ const cancelRide = async (req, res) => {
     const ride = await Ride.findByPk(rideId);
     if (!ride) {
       return res.status(404).json({ error: 'Viaje no encontrado.' });
+    }
+
+    if (ride.requestMode === 'quick_assignment' && ride.status === 'requested') {
+      return require('./quickAssignmentController').cancel(req, res);
     }
 
     // ── Verificar estado cancelable ───────────────────────────────────────

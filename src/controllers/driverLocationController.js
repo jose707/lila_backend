@@ -1,6 +1,77 @@
 // backend/src/controllers/driverLocationController.js
-const { Driver, DriverLocation } = require('../models');
+const { Driver, DriverLocation, Ride } = require('../models');
 const sequelize = require('../config/database');
+
+// Native foreground tracking uses this endpoint while React Native is backgrounded.
+// The ride and driver are checked on every update so an old service cannot keep
+// tracking after cancellation, completion, logout, or reassignment.
+exports.updateActiveRideLocation = async (req, res) => {
+  try {
+    const { latitude, longitude, heading, speed } = req.body;
+    if (![latitude, longitude].every(Number.isFinite) ||
+        Math.abs(latitude) > 90 || Math.abs(longitude) > 180 ||
+        (heading != null && (!Number.isFinite(heading) || heading < 0 || heading >= 360)) ||
+        (speed != null && (!Number.isFinite(speed) || speed < 0))) {
+      return res.status(400).json({ error: 'Ubicación inválida.' });
+    }
+    const driver = await Driver.findOne({ where: { userId: req.user.id } });
+    if (!driver) return res.status(403).json({ error: 'Conductor no encontrado.' });
+    const ride = await Ride.findByPk(req.params.rideId);
+    if (!ride || ride.driverId !== driver.id ||
+        !['accepted', 'arrived', 'in_progress'].includes(ride.status)) {
+      return res.status(409).json({ error: 'El viaje ya no está activo.' });
+    }
+
+    const values = {
+      location_recorded_at: new Date(),
+      location: sequelize.fn('ST_GeomFromText', `POINT(${longitude} ${latitude})`, 4326),
+      ...(heading != null ? { heading } : {}),
+      ...(speed != null ? { speed } : {}),
+    };
+    const [location, created] = await DriverLocation.findOrCreate({
+      where: { driver_id: driver.id },
+      defaults: { driver_id: driver.id, heading: null, speed: null, ...values, is_online: true },
+    });
+    if (!created) await location.update(values);
+
+    const { getIO } = require('../socket');
+    getIO().to(`ride:${ride.id}`).emit('driver:location:changed', {
+      rideId: ride.id,
+      driverId: driver.id,
+      latitude,
+      longitude,
+      heading: heading ?? null,
+      speed: speed ?? null,
+      timestamp: new Date().toISOString(),
+    });
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('Foreground ride location:', error);
+    return res.status(500).json({ error: 'No se pudo actualizar la ubicación.' });
+  }
+};
+
+// Idempotent fallback for background transitions when the socket is already suspended.
+exports.setCurrentDriverOffline = async (req, res) => {
+  try {
+    const driver = await Driver.findOne({ where: { userId: req.user.id } });
+    if (!driver) return res.status(403).json({ error: 'Conductor no encontrado.' });
+    await DriverLocation.update(
+      { is_online: false },
+      { where: { driver_id: driver.id } },
+    );
+    const { getIO } = require('../socket');
+    const io = getIO();
+    if (typeof io.in === 'function') {
+      const sockets = await io.in(`user:${req.user.id}`).fetchSockets();
+      await Promise.all(sockets.map(socket => socket.leave('drivers:available')));
+    }
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('Background driver offline:', error);
+    return res.status(500).json({ error: 'No se pudo desconectar al conductor.' });
+  }
+};
 
 exports.updateLocation = async (req, res) => {
   try {
@@ -17,6 +88,7 @@ exports.updateLocation = async (req, res) => {
 
     // Validate coordinates
     if (
+      !Number.isFinite(latitude) || !Number.isFinite(longitude) ||
       latitude < -90 ||
       latitude > 90 ||
       longitude < -180 ||
@@ -43,10 +115,15 @@ exports.updateLocation = async (req, res) => {
       sequelize.col('location'),
     );
 
+    if (driver.userId !== req.user.id) {
+      return res.status(403).json({ error: 'No puedes modificar la ubicación de otro conductor.' });
+    }
+
     const [location, created] = await DriverLocation.findOrCreate({
       where: { driver_id: driverId },
       defaults: {
         driver_id: driverId,
+        location_recorded_at: new Date(),
         location: sequelize.fn(
           'ST_GeomFromText',
           `POINT(${longitude} ${latitude})`,
@@ -60,6 +137,7 @@ exports.updateLocation = async (req, res) => {
 
     // If already exists, update it
     if (!created) {
+      location.location_recorded_at = new Date();
       location.location = sequelize.fn(
         'ST_GeomFromText',
         `POINT(${longitude} ${latitude})`,
@@ -172,7 +250,7 @@ exports.getNearbyDrivers = async (req, res) => {
         dl.driver_id,
         d.id,
         d."userId",
-        u.name,
+        CONCAT_WS(' ', ui.first_names, ui.paternal_surname, ui.maternal_surname) AS name,
         u."profilePhoto",
         ST_Y(dl.location) as latitude,
         ST_X(dl.location) as longitude,
@@ -187,6 +265,7 @@ exports.getNearbyDrivers = async (req, res) => {
       FROM driver_locations dl
       JOIN drivers d ON dl.driver_id = d.id
       JOIN users u ON d."userId" = u.id
+      LEFT JOIN user_identities ui ON ui.user_id = u.id
       WHERE dl.is_online = true
       AND ST_DWithin(
         dl.location::geography,
@@ -296,6 +375,8 @@ exports.setDriverOnlineStatus = async (req, res) => {
       });
     }
 
+    const owner = await Driver.findOne({ where: { id: driverId, userId: req.user.id } });
+    if (!owner || typeof is_online !== 'boolean') return res.status(403).json({ error: 'Disponibilidad no autorizada.' });
     const location = await DriverLocation.findByPk(driverId);
 
     if (!location) {

@@ -105,6 +105,11 @@ const Ride = sequelize.define(
       ),
       defaultValue: 'requested',
     },
+    requestMode: { type: DataTypes.STRING, allowNull: false, defaultValue: 'negotiation', field: 'request_mode' },
+    requestKey: { type: DataTypes.STRING, field: 'request_key' },
+    pickupDistance: { type: DataTypes.DOUBLE, field: 'pickup_distance' },
+    pickupDuration: { type: DataTypes.INTEGER, field: 'pickup_duration' },
+    pickupSurcharge: { type: DataTypes.DECIMAL(10, 2), defaultValue: 0, field: 'pickup_surcharge' },
     vehicle_type_requested: {
       type: DataTypes.ENUM('taxi', 'minibus', 'bus', 'motorcycle'),
       allowNull: true,
@@ -122,11 +127,6 @@ const Ride = sequelize.define(
       references: { model: 'service_areas', key: 'id' },
       comment:
         'Zona donde ocurrió el viaje. NULL = dato histórico previo a zonas',
-    },
-    promo_code_id: {
-      type: DataTypes.UUID,
-      allowNull: true,
-      references: { model: 'promo_codes', key: 'id' },
     },
     cancellation_reason_id: {
       type: DataTypes.UUID,

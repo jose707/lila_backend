@@ -106,7 +106,7 @@ router.get('/overdue', async (req, res) => {
     const [rows] = await sequelize.query(`
       SELECT
         d.id                           AS driver_id,
-        u.name,
+        CONCAT_WS(' ', ui.first_names, ui.paternal_surname, ui.maternal_surname) AS name,
         u.phone,
         u.email,
         COUNT(cs.id)                   AS settlements_vencidos,
@@ -115,8 +115,9 @@ router.get('/overdue', async (req, res) => {
       FROM commission_settlements cs
       JOIN drivers d ON d.id = cs.driver_id
       JOIN users   u ON u.id = d."userId"
+      LEFT JOIN user_identities ui ON ui.user_id = u.id
       WHERE cs.status = 'overdue'
-      GROUP BY d.id, u.name, u.phone, u.email
+      GROUP BY d.id, ui.first_names, ui.paternal_surname, ui.maternal_surname, u.phone, u.email
       ORDER BY deuda_total DESC;
     `);
 

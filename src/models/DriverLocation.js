@@ -31,6 +31,7 @@ const DriverLocation = sequelize.define(
       defaultValue: true,
       allowNull: false,
     },
+    location_recorded_at: { type: DataTypes.DATE, allowNull: true },
   },
   {
     tableName: 'driver_locations',

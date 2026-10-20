@@ -7,6 +7,8 @@ const router = express.Router();
 
 // Update driver location (driver can update their own, everyone can get)
 router.post('/update', authMiddleware, driverLocationController.updateLocation);
+router.post('/ride/:rideId', authMiddleware, driverLocationController.updateActiveRideLocation);
+router.put('/status/offline', authMiddleware, driverLocationController.setCurrentDriverOffline);
 
 // Get driver location by ID
 router.get('/:driverId', driverLocationController.getDriverLocation);

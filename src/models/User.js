@@ -12,8 +12,10 @@ const User = sequelize.define(
       primaryKey: true,
     },
     name: {
-      type: DataTypes.STRING,
-      allowNull: false,
+      // Nombre oficial vive únicamente en user_identities. Se conserva como
+      // virtual por compatibilidad temporal con respuestas de la aplicación.
+      type: DataTypes.VIRTUAL,
+      allowNull: true,
     },
     email: {
       type: DataTypes.STRING,
@@ -60,10 +62,10 @@ const User = sequelize.define(
       defaultValue: true,
       field: 'is_active',
     },
-    isVerified: {
+    phoneVerified: {
       type: DataTypes.BOOLEAN,
       defaultValue: false,
-      field: 'is_verified',
+      field: 'phone_verified',
     },
     lastLogin: {
       type: DataTypes.DATE,

@@ -17,9 +17,9 @@ async function checkData() {
     );
     const requestsCount = requestsResult[0][0]?.count || 0;
 
-    // Contar request_files
+    // Contar documentos (reemplaza a request_files)
     const filesResult = await sequelize.query(
-      'SELECT COUNT(*) as count FROM request_files;',
+      'SELECT COUNT(*) as count FROM documents;',
     );
     const filesCount = filesResult[0][0]?.count || 0;
 
@@ -27,7 +27,7 @@ async function checkData() {
     console.log('=====================');
     console.log(`drivers: ${driversCount}`);
     console.log(`driver_requests: ${requestsCount}`);
-    console.log(`request_files: ${filesCount}`);
+    console.log(`documents: ${filesCount}`);
 
     if (driversCount === 0 && requestsCount === 0) {
       console.log('\n⚠️  SIN DATOS');

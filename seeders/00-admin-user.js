@@ -9,14 +9,14 @@ module.exports = {
     await queryInterface.bulkInsert('users', [
       {
         id: '00000000-0000-0000-0000-000000000001',
-        name: 'Administrador',
         email: 'admin@linealila.com',
         phone: '+59170000001',
         password: hashedPassword,
         role: 'admin',
         is_active: true,
-        is_verified: true,
+        phone_verified: true,
         current_mode: 'admin',
+        firebase_uid: 'admin_firebase_001',
         created_at: new Date(),
         updated_at: new Date(),
       },

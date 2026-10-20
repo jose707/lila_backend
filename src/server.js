@@ -9,19 +9,10 @@ const path = require('path');
 // Cargar variables de entorno PRIMERO (independiente del cwd)
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
-// 🔥 VERIFICACIÓN CRÍTICA: Asegurar que DATABASE_URL está cargada en producción
 if (process.env.NODE_ENV === 'production') {
-  if (!process.env.DATABASE_URL) {
-    console.error('❌ ERROR CRÍTICO: DATABASE_URL no está definida en producción');
-    console.error('   Render debe inyectar esta variable automáticamente.');
-    console.error('   Verifica que esté configurada en Environment Variables.');
-    console.error('   La variable debe contener la Internal Database URL de PostgreSQL.');
-    process.exit(1);
-  }
-  console.log('✅ DATABASE_URL encontrada (modo producción)');
+  require('./services/identitySessionCrypto').storageKey();
+  if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) throw new Error('Configure a strong JWT_SECRET before starting production');
 }
-
-console.log(`🔌 Modo base de datos: ${process.env.DATABASE_URL ? '✅ Usando DATABASE_URL' : '⚠️ Usando variables separadas (modo desarrollo)'}`);
 
 const sequelize = require('./config/database');
 
@@ -68,6 +59,8 @@ app.use(express.urlencoded({ limit: '10mb', extended: true }));
 // Servir archivos estáticos de uploads CON HEADERS ANTI-CACHE
 app.use(
   '/uploads',
+  require('./middleware/auth').authMiddleware,
+  require('./middleware/documentAccess'),
   (req, res, next) => {
     // Agregar headers para prevenir caching
     res.set(
@@ -87,6 +80,7 @@ app.use('/api/users', require('./routes/users'));
 app.use('/api/requests', require('./routes/requests')); // Nuevo: manejar requests versionadas
 app.use('/api/drivers', require('./routes/drivers'));
 app.use('/api/rides', require('./routes/rides'));
+app.use('/api/places', require('./routes/places'));
 app.use('/api/ratings', require('./routes/ratings'));
 app.use('/api/vehicles', require('./routes/vehicles'));
 app.use('/api/ride-offers', require('./routes/rideOffers'));
@@ -100,8 +94,6 @@ app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'OK',
     timestamp: new Date().toISOString(),
-    database: process.env.DATABASE_URL ? 'configured' : 'not configured',
-    environment: process.env.NODE_ENV || 'development'
   });
 });
 
@@ -156,21 +148,26 @@ const startServer = async () => {
     await sequelize.sync(syncOptions);
     console.log('✅ Base de datos sincronizada correctamente\n');
 
+    // Marcar como expirados los rides vencidos que quedaron huérfanos
+    await sequelize.query(`
+      UPDATE rides
+      SET status = 'expired'
+      WHERE status IN ('requested', 'offered') AND expires_at < NOW()
+    `);
+
     const httpServer = http.createServer(app);
     initializeSocket(httpServer);
+    const { expireReservations } = require('./services/quickAssignmentService');
+    const reservationTimer = setInterval(() => {
+      expireReservations().catch(error => console.error('Reservation expiry:', error.message));
+    }, 1000);
+    reservationTimer.unref();
     httpServer.listen(PORT, () => {
-      console.log(`\n🚀 Servidor ejecutándose en puerto ${PORT}`);
-      console.log(`📍 Entorno: ${process.env.NODE_ENV || 'development'}`);
-      console.log(`🗄️  Base de datos: ${process.env.DATABASE_URL ? 'PostgreSQL (Render)' : 'PostgreSQL (Local)'}`);
-      console.log(`✅ Health check: http://localhost:${PORT}/health\n`);
+      console.log(`Servidor ejecutándose en http://localhost:${PORT}`);
+      console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);
     });
   } catch (error) {
-    console.error('❌ Error al iniciar el servidor:', error);
-    console.error('\n🔍 Posibles causas:');
-    console.error('   1. DATABASE_URL no está configurada en las variables de entorno');
-    console.error('   2. La base de datos no está accesible (verificar región en Render)');
-    console.error('   3. La contraseña o credenciales son incorrectas');
-    console.error('   4. La base de datos no existe o está pausada');
+    console.error('Error al iniciar el servidor:', error);
     process.exit(1);
   }
 };
