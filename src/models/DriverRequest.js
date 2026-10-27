@@ -27,7 +27,7 @@ const DriverRequest = sequelize.define(
       defaultValue: 1,
     },
     status: {
-      type: DataTypes.ENUM('pending', 'approved', 'rejected'),
+      type: DataTypes.ENUM('pending', 'observed', 'approved', 'rejected'),
       allowNull: false,
       defaultValue: 'pending',
     },

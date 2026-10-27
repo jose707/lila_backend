@@ -1062,6 +1062,17 @@ function parseLicense(text, options) {
   return result;
 }
 
+// ─── Parser: Tarjeta de Identificación del Conductor (TIC) ─────────────────
+function parseTic(text) {
+  const names = labeledValue(text, ['NOMBRES', 'NOMBRE']);
+  const surnames = labeledValue(text, ['APELLIDOS', 'APELLIDO']);
+  const fullName = labeledValue(text, ['NOMBRE COMPLETO', 'NOMBRES Y APELLIDOS']) ||
+    [names, surnames].filter(Boolean).join(' ').trim();
+  const licenseLine = valueAfterKeyword(text, ['NUMERO DE LICENCIA', 'NRO DE LICENCIA', 'LICENCIA']);
+  const licenseNumber = (licenseLine.match(/\b\d{6,9}\b/) || [])[0] || '';
+  return { fullName, licenseNumber };
+}
+
 // ─── Parser: SOAT ────────────────────────────────────────────────────────────
 function parseSoat(text) {
   const result = { soatRosetteNumber: '', soatStartDate: '', soatExpiryDate: '', soatUse: '' };
@@ -1172,6 +1183,7 @@ const PARSERS = {
   ciBack: parseCI,
   licenseFront: parseLicense,
   licenseBack: parseLicense,
+  ticPhoto: parseTic,
   soatPhoto: parseSoat,
   ruatPhoto: parseRuat,
 };
@@ -1182,6 +1194,7 @@ const REQUIRED_BY_TYPE = {
   ciBack: ['birthPlace', 'address', 'occupation', 'maritalStatus'],
   licenseFront: ['licenseNumber', 'fullName', 'nationality', 'issueDate', 'licenseExpiryDate', 'birthDate', 'licenseCategory'],
   licenseBack: ['licenseNumber', 'issueDate', 'licenseExpiryDate', 'glasses', 'bloodType', 'hearingAid', 'licenseCategory'],
+  ticPhoto: ['fullName', 'licenseNumber'],
   soatPhoto: ['soatExpiryDate'],
   ruatPhoto: ['vehiclePlate', 'vehicleBrand', 'vehicleModel', 'vehicleYear', 'vehicleColor', 'vehicleOwnerName', 'vehicleOwnerCi'],
   antecedentsPhoto: [],
@@ -1217,6 +1230,9 @@ async function extractDocument(buffer, documentType) {
     const v = validateCI(rawText, facesFound, documentType);
     rejected = v.rejected;
     rejectReason = v.rejectReason;
+  } else if (documentType === 'ticPhoto' && !/TARJETA\s+(?:DE\s+)?IDENTIFICACION\s+(?:DEL?\s+)?CONDUCTOR|\bT\.?I\.?C\.?\b/.test(normalize(rawText))) {
+    rejected = true;
+    rejectReason = 'La foto no parece ser una Tarjeta de Identificación del Conductor (TIC).';
   }
 
   const required = fields.format === 'legacy'
@@ -1235,6 +1251,7 @@ module.exports = {
   annotateImageBuffer,
   parseCI,
   parseLicense,
+  parseTic,
   parseSoat,
   parseRuat,
   parseMRZ,

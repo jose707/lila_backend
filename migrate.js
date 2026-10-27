@@ -13,6 +13,7 @@ const APP_TABLES = new Set([
   'ride_waypoints',
   'driver_locations',
   'driver_requests',
+  'driver_domiciles',
   'documents',
   'service_areas',
   'cancellation_reasons',

@@ -44,6 +44,7 @@ users ──────────────────── drivers ─�
   ├── user_identities          ├── documents
   ├── documents ───────────────┘
   │                           ├── driver_locations
+  │                           ├── driver_domiciles
   │                           ├── driver_requests ── documents
   │                           ├── driver_earnings ── commission_settlements
   │                           └── ride_offers
@@ -417,13 +418,33 @@ Solicitudes de registro como conductor. Incluye el historial de versiones si hay
 | `id` | UUID | NO | Identificador único |
 | `driver_id` | UUID | YES | FK → drivers (si ya fue creado) |
 | `user_id` | UUID | NO | FK → users |
-| `status` | ENUM | NO | `pending`, `approved`, `rejected` |
-| `rejection_reason` | TEXT | YES | Razón del rechazo |
-| `rejected_documents` | JSON | YES | Lista de documentos rechazados |
-| `metadata` | JSON | YES | Datos adicionales del proceso |
+| `status` | ENUM | NO | `pending`, `observed`, `approved`, `rejected` |
+| `rejection_reason` | TEXT | YES | Motivo de observación o rechazo (nombre heredado de la columna) |
+| `rejected_documents` | JSON | YES | Documentos que deben corregirse al observar la solicitud (nombre heredado) |
+| `metadata` | JSON | YES | Datos OCR y auxiliares de la solicitud; el domicilio se guarda en `driver_domiciles` |
 | `version` | INTEGER | NO | Versión del intento (incrementa en cada reenvío) |
 | `created_at` | TIMESTAMPTZ | NO | Fecha de creación |
 | `updated_at` | TIMESTAMPTZ | NO | Fecha de última modificación |
+
+`pending` = recibida para revisión; `observed` = requiere correcciones y puede reenviarse; `approved` = habilitada; `rejected` = decisión negativa. En una base existente, ejecutar `npm run migrate:driver-request-status` dentro de `backend` para agregar `observed` al ENUM; la migración maestra ya lo incluye para bases nuevas.
+
+### `driver_domiciles`
+
+Una fila por versión de solicitud. El domicilio declarado puede diferir del domicilio impreso en `user_identities.address` (CI). No se utiliza para la posición operativa del conductor.
+
+| Columna | Tipo | Descripción |
+|---|---|---|
+| `id` | UUID | Identificador |
+| `user_id` | UUID | Usuario solicitante |
+| `driver_request_id` | UUID UNIQUE | Solicitud/version a la que pertenece |
+| `address` | VARCHAR(255) | Dirección actual declarada |
+| `location` | GEOMETRY(POINT, 4326) | Punto marcado en el mapa |
+| `verification_status` | VARCHAR(20) | `pending`, `verified` o `rejected` |
+| `verified_by`, `verified_at` | UUID, TIMESTAMPTZ | Revisor y fecha |
+| `rejection_reason` | TEXT | Motivo de observación |
+| `created_at`, `updated_at` | TIMESTAMPTZ | Historial |
+
+El comprobante permanece en `documents` con tipo `domicileProof` y el mismo `driver_request_id`. En una base existente, ejecutar `npm run migrate:driver-domiciles`: crea la tabla, traslada los domicilios válidos de `metadata` y elimina allí la copia. Las entradas inválidas quedan intactas para revisión manual.
 
 ---
 
@@ -437,13 +458,17 @@ vinculan mediante `driver_request_id`.
 |---|---|
 | `user_id`, `driver_id`, `vehicle_id` | Propietario del documento; solo `user_id` es obligatorio |
 | `driver_request_id` | Solicitud de conductor que presentó el archivo; conserva las versiones y el historial |
-| `document_type` | `ciFront`, `ciBack`, `licenseFront`, `licenseBack`, `antecedentsPhoto`, `ruatPhoto`, `soatPhoto` o fotos del vehículo/perfil |
+| `document_type` | `ciFront`, `ciBack`, `licenseFront`, `licenseBack`, `ticPhoto`, `antecedentsPhoto`, `ruatPhoto`, `soatPhoto`, `domicileProof` o fotos del vehículo/perfil |
 | `file_path`, `original_filename`, `mime_type`, `file_size` | Archivo almacenado |
 | `ocr_data`, `issued_at`, `expires_at` | Lectura OCR y vigencias |
 | `is_current` | Permite conservar documentos vencidos como historial |
-| `verification_status`, `verified_at`, `verified_by`, `rejection_reason` | Decisión automática. Estado: `pending`, `verified` o `rejected` |
+| `verification_status`, `verified_at`, `verified_by`, `rejection_reason` | Revisión documental administrativa. Estado: `pending`, `verified` o `rejected` |
 
-Un documento pasa a `verified` automáticamente cuando el OCR entregó los campos obligatorios, superó las comparaciones aplicables (CI/licencia, CI/RUAT, RUAT/SOAT) y tiene vigencia válida. La solicitud se aprueba automáticamente solo cuando todos sus archivos obligatorios están presentes y verificados; de lo contrario queda rechazada con el motivo técnico.
+El OCR y las comparaciones (CI/licencia, TIC/CI y licencia, CI/RUAT, RUAT/SOAT) validan el envío inicial, pero la solicitud queda `pending`. El administrador marca los documentos revisados y decide `approved`, `observed` o `rejected`. Solo al aprobar se crean el conductor y el vehículo. `observed` permite corregir y reenviar los documentos señalados; `rejected` es una decisión final. La TIC se guarda como documento, sin duplicar el nombre del conductor.
+
+En una base existente, ejecutar `npm run migrate:tic` dentro de `backend` para permitir `ticPhoto` en el `CHECK` de `documents.document_type`. La migración maestra ya lo incluye para bases nuevas.
+
+El domicilio requiere dirección escrita, ubicación marcada en el mapa y `domicileProof`. Los dos primeros se guardan en `driver_domiciles`; la foto se guarda en `documents`. El administrador comprueba el conjunto y puede observarlo para corrección. Para una base existente, ejecutar primero `npm run migrate:domicile` si aún no se ejecutó, y después `npm run migrate:driver-domiciles`. La migración maestra incluye ambos para bases nuevas.
 
 ---
 
@@ -658,7 +683,7 @@ settlement_payment_method: 'cash', 'qr', 'transfer'
 audit_action: 'INSERT', 'UPDATE', 'DELETE'
 
 -- document_type es VARCHAR con valores controlados por CHECK en documents
--- (ciFront, ciBack, licenseFront, licenseBack, antecedentes, RUAT, SOAT y fotos del vehículo)
+-- (ciFront, ciBack, licenseFront, licenseBack, ticPhoto, antecedentes, RUAT, SOAT y fotos del vehículo)
 ```
 
 ---

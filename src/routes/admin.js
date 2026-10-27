@@ -2,6 +2,7 @@
 const express = require('express');
 const router = express.Router();
 const adminController = require('../controllers/adminController');
+const driverReviewController = require('../controllers/driverReviewController');
 const { authMiddleware, adminMiddleware } = require('../middleware/auth');
 
 router.get(
@@ -44,7 +45,13 @@ router.put(
   '/requests/:requestId/approve',
   authMiddleware,
   adminMiddleware,
-  adminController.approveDriver,
+  driverReviewController.approveDriver,
+);
+router.put(
+  '/requests/:requestId/observe',
+  authMiddleware,
+  adminMiddleware,
+  driverReviewController.observeDriver,
 );
 router.put(
   '/drivers/:driverId/reject',
@@ -56,7 +63,7 @@ router.put(
   '/requests/:requestId/reject',
   authMiddleware,
   adminMiddleware,
-  adminController.rejectDriver,
+  driverReviewController.rejectDriver,
 );
 router.delete(
   '/drivers/:driverId',

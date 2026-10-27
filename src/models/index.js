@@ -15,6 +15,7 @@ const Rating              = require('./Rating');
 const Vehicle             = require('./Vehicle');
 const DriverLocation      = require('./DriverLocation');
 const DriverRequest       = require('./DriverRequest');
+const DriverDomicile      = require('./DriverDomicile');
 const RequestFile         = require('./RequestFile');
 const Notification        = require('./Notification');
 const CancellationReason  = require('./CancellationReason');
@@ -40,6 +41,7 @@ module.exports = {
   Vehicle,
   DriverLocation,
   DriverRequest,
+  DriverDomicile,
   RequestFile,
   Notification,
   CancellationReason,

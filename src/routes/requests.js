@@ -42,6 +42,7 @@ const uploadFields = upload.fields([
   { name: 'ciBack', maxCount: 1 },
   { name: 'licenseFront', maxCount: 1 },
   { name: 'licenseBack', maxCount: 1 },
+  { name: 'ticPhoto', maxCount: 1 },
   { name: 'antecedentsPhoto', maxCount: 1 },
   { name: 'carFront', maxCount: 1 },
   { name: 'carBack', maxCount: 1 },
@@ -49,6 +50,7 @@ const uploadFields = upload.fields([
   { name: 'carRight', maxCount: 1 },
   { name: 'soatPhoto', maxCount: 1 },
   { name: 'ruatPhoto', maxCount: 1 },
+  { name: 'domicileProof', maxCount: 1 },
 ]);
 
 // Register new driver request

@@ -1,7 +1,7 @@
 // backend/src/controllers/requestController.js
-const Driver = require('../models/Driver');
-const Vehicle = require('../models/Vehicle');
 const DriverRequest = require('../models/DriverRequest');
+const DriverDomicile = require('../models/DriverDomicile');
+const sequelize = require('../config/database');
 const RequestFile = require('../models/RequestFile');
 const User = require('../models/User');
 const UserIdentity = require('../models/UserIdentity');
@@ -17,10 +17,20 @@ const toIsoDate = value => {
 };
 
 const REQUIRED_DRIVER_DOCUMENTS = [
-  'licenseFront', 'licenseBack',
+  'licenseFront', 'licenseBack', 'ticPhoto',
   'antecedentsPhoto', 'carFront', 'carBack',
   'soatPhoto', 'ruatPhoto',
+  'domicileProof',
 ];
+
+const validDomicile = (address, latitude, longitude) => {
+  const lat = Number(latitude);
+  const lng = Number(longitude);
+  return typeof address === 'string' && address.trim().length >= 8 && address.trim().length <= 255 &&
+    String(latitude ?? '').trim() !== '' && String(longitude ?? '').trim() !== '' &&
+    Number.isFinite(lat) && Number.isFinite(lng) &&
+    lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+};
 
 const isFutureOrToday = value => {
   const iso = toIsoDate(value);
@@ -157,6 +167,10 @@ const registerDriver = async (req, res) => {
     if (!userId) {
       return res.status(401).json({ error: 'Usuario no autenticado' });
     }
+    const previousRequest = await DriverRequest.findOne({ where: { userId }, order: [['version', 'DESC']] });
+    if (previousRequest) {
+      return res.status(409).json({ error: 'Ya tienes una solicitud. Consulta su estado o reenvía los documentos observados.' });
+    }
 
     const {
       firstName,
@@ -187,6 +201,9 @@ const registerDriver = async (req, res) => {
       vehicleBrand,
       vehicleModel,
       ocrData,
+      domicileAddress,
+      domicileLatitude,
+      domicileLongitude,
     } = req.body;
 
     // Datos OCR por documento (para verificación del admin)
@@ -229,6 +246,25 @@ const registerDriver = async (req, res) => {
     }
     if (licenseBackOcr.bloodType && identity.bloodType && licenseBackOcr.bloodType !== identity.bloodType) {
       return res.status(400).json({ error: 'El grupo sanguíneo de la licencia no coincide con la cédula.' });
+    }
+    // La TIC se verifica desde el archivo recibido, no desde el JSON OCR del cliente.
+    const ticFile = req.files?.ticPhoto?.[0];
+    if (ticFile) {
+      const ticImage = await sharp(await fs.promises.readFile(ticFile.path))
+        .rotate().png().toBuffer();
+      const ticRead = await ocrService.extractDocument(await preprocessForOcr(ticImage), 'ticPhoto');
+      if (ticRead.rejected || ticRead.missing.length) {
+        return res.status(422).json({
+          error: ticRead.rejectReason || 'No se pudieron leer el nombre y número de licencia de la TIC.',
+        });
+      }
+      if (compactIdentity(ticRead.fields.fullName) !== compactIdentity(officialName) ||
+          ticRead.fields.licenseNumber !== licenseOcr.licenseNumber) {
+        return res.status(422).json({
+          error: 'El nombre o número de licencia de la TIC no coincide con la identidad y licencia verificadas.',
+        });
+      }
+      ocr.ticPhoto = { fields: ticRead.fields, text: ticRead.rawText };
     }
     const ruatOcr = ocr.ruatPhoto?.fields || {};
     const comparableCi = value => String(value || '').replace(/\D/g, '');
@@ -295,8 +331,21 @@ const registerDriver = async (req, res) => {
       }
     }
 
-    // Create first DriverRequest (version 1) - sin crear Driver aún
-    const request = await DriverRequest.create({
+    const submittedTypes = new Set(Object.keys(req.files || {}).filter(type => req.files[type]?.[0]));
+    const missingFiles = REQUIRED_DRIVER_DOCUMENTS.filter(type => !submittedTypes.has(type));
+    const soatOcr = ocr.soatPhoto?.fields || {};
+    const submissionError =
+      missingFiles.length ? `Faltan documentos obligatorios: ${missingFiles.join(', ')}.` :
+      !validDomicile(domicileAddress, domicileLatitude, domicileLongitude) ? 'Indica una dirección y marca el domicilio en el mapa.' :
+      !isFutureOrToday(licenseOcr.licenseExpiryDate) ? 'La licencia de conducir está vencida o no tiene una fecha de vencimiento válida.' :
+      !isFutureOrToday(soatOcr.soatExpiryDate) ? 'El SOAT está vencido o no tiene una fecha de vencimiento válida.' :
+      soatOcr.soatUse !== 'PUBLICO' ? 'El SOAT debe indicar uso PUBLICO para registrar un vehículo de transporte.' :
+      '';
+    if (submissionError) return res.status(422).json({ error: submissionError });
+
+    // La solicitud queda pendiente; solo la revisión administrativa puede resolverla.
+    const request = await sequelize.transaction(async transaction => {
+      const createdRequest = await DriverRequest.create({
       userId,
       driverId: null, // Se asignará cuando se apruebe
       version: 1,
@@ -334,6 +383,14 @@ const registerDriver = async (req, res) => {
         soatUse: (ocr.soatPhoto?.fields || {}).soatUse || undefined,
         ocr,
       },
+      }, { transaction });
+      await DriverDomicile.create({
+        userId,
+        driverRequestId: createdRequest.id,
+        address: domicileAddress.trim(),
+        location: { type: 'Point', coordinates: [Number(domicileLongitude), Number(domicileLatitude)] },
+      }, { transaction });
+      return createdRequest;
     });
 
     // Guardar archivos
@@ -345,17 +402,18 @@ const registerDriver = async (req, res) => {
       const fileFields = [
         'licenseFront',
         'licenseBack',
+        'ticPhoto',
         'antecedentsPhoto',
         'carFront',
         'carBack',
         'soatPhoto',
         'ruatPhoto',
+        'domicileProof',
       ];
 
       for (const field of fileFields) {
         if (req.files[field] && req.files[field][0]) {
           const file = req.files[field][0];
-          try {
             // Use findOrCreate to avoid duplicates
             const [fileRecord, created] = await RequestFile.findOrCreate({
               where: {
@@ -382,9 +440,6 @@ const registerDriver = async (req, res) => {
             } else {
               console.log(`✅ File saved: ${field} -> ${file.filename}`);
             }
-          } catch (fileError) {
-            console.error(`❌ Error saving ${field}:`, fileError.message);
-          }
         } else {
           console.log(`⏭️  File not provided: ${field}`);
         }
@@ -393,88 +448,13 @@ const registerDriver = async (req, res) => {
       console.log('⚠️ NO FILES received in request');
     }
 
-    // Decisión automática: no hay aprobación manual. El registro solo se
-    // habilita si los documentos requeridos, cruces OCR y vigencias son válidos.
-    const storedFiles = await RequestFile.findAll({ where: { requestId: request.id } });
-    const storedTypes = new Set(storedFiles.map(file => file.fileType));
-    const missingFiles = REQUIRED_DRIVER_DOCUMENTS.filter(type => !storedTypes.has(type));
-    const soatOcr = ocr.soatPhoto?.fields || {};
-    const automaticRejection =
-      missingFiles.length ? `Faltan documentos obligatorios: ${missingFiles.join(', ')}.` :
-      !isFutureOrToday(licenseOcr.licenseExpiryDate) ? 'La licencia de conducir está vencida o no tiene una fecha de vencimiento válida.' :
-      !isFutureOrToday(soatOcr.soatExpiryDate) ? 'El SOAT está vencido o no tiene una fecha de vencimiento válida.' :
-      soatOcr.soatUse !== 'PUBLICO' ? 'El SOAT debe indicar uso PUBLICO para registrar un vehículo de transporte.' :
-      '';
-
-    if (automaticRejection) {
-      await request.update({ status: 'rejected', rejectionReason: automaticRejection });
-      return res.status(422).json({
-        error: automaticRejection,
-        request: { id: request.id, version: request.version, status: 'rejected' },
-      });
-    }
-
-    await RequestFile.update(
-      { status: 'verified', verifiedAt: new Date() },
-      { where: { requestId: request.id } },
-    );
-
-    const driver = await Driver.create({
-      userId,
-      status: 'approved',
-      licenseNumber: licenseOcr.licenseNumber,
-      licenseNationality: licenseOcr.nationality || null,
-      licenseIssueDate: toIsoDate(licenseOcr.issueDate),
-      licenseExpiry: toIsoDate(licenseOcr.licenseExpiryDate),
-      licenseCategory: licenseOcr.licenseCategory || null,
-      licenseWearsGlasses: licenseBackOcr.glasses === 'Sí',
-      licenseUsesHearingAid: licenseBackOcr.hearingAid === 'Sí',
-      licenseVerificationStatus: 'verified',
-      licenseVerifiedAt: new Date(),
-      isAvailable: true,
-    });
-    const vehicle = await Vehicle.create({
-      driver_id: driver.id,
-      brand: ruatOcr.vehicleBrand,
-      model: ruatOcr.vehicleModel,
-      year: parseInt(ruatOcr.vehicleYear),
-      color: ruatOcr.vehicleColor,
-      plate: ruatOcr.vehiclePlate,
-      capacity: parseInt(ruatOcr.vehiclePassengerCapacity) || 4,
-      vehicle_type: normalizedVehicleType,
-      registrationMunicipality: ruatOcr.registrationMunicipality || null,
-      crpvaNumber: ruatOcr.crpvaNumber || null,
-      ruatIssueDate: toIsoDate(ruatOcr.ruatIssueDate),
-      ownershipStartDate: toIsoDate(ruatOcr.ownershipStartDate),
-      doorCount: parseInt(ruatOcr.doorCount) || null,
-      serviceType: ruatOcr.serviceType || null,
-      chassisNumber: ruatOcr.chassisNumber || null,
-      engineNumber: ruatOcr.engineNumber || null,
-      fuelType: ruatOcr.fuelType || null,
-      engineDisplacement: ruatOcr.engineDisplacement || null,
-      engineType: ruatOcr.engineType || null,
-      legalObservations: ruatOcr.legalObservations || null,
-      ruatVerified: true,
-      ruatVerifiedAt: new Date(),
-      soatRosetteNumber: soatOcr.soatRosetteNumber || null,
-      soatStartDate: toIsoDate(soatOcr.soatStartDate),
-      soatExpiryDate: toIsoDate(soatOcr.soatExpiryDate),
-      soatUse: soatOcr.soatUse,
-      soatVerificationStatus: 'verified',
-      soatVerifiedAt: new Date(),
-      status: 'active',
-    });
-    await request.update({ driverId: driver.id, status: 'approved' });
-
     res.status(201).json({
-      message: 'Registro aprobado automáticamente.',
+      message: 'Solicitud enviada para revisión administrativa.',
       request: {
         id: request.id,
         version: request.version,
         status: request.status,
       },
-      driver: { id: driver.id },
-      vehicle: { id: vehicle.id },
     });
   } catch (error) {
     console.error('Error registering driver:', error);
@@ -572,10 +552,13 @@ const resubmitDocuments = async (req, res) => {
       });
     }
 
-    if (latestRequest.status !== 'rejected') {
+    if (!['observed', 'rejected'].includes(latestRequest.status)) {
       return res.status(400).json({
-        error: 'Solo se pueden reenviar documentos de solicitudes rechazadas',
+        error: 'Solo se pueden reenviar documentos de solicitudes observadas o rechazadas anteriores',
       });
+    }
+    if (latestRequest.status === 'rejected' && latestRequest.metadata?.finalRejection) {
+      return res.status(403).json({ error: 'La solicitud fue rechazada definitivamente y no puede reenviarse.' });
     }
 
     // Merge updated metadata fields if provided by the user
@@ -595,16 +578,79 @@ const resubmitDocuments = async (req, res) => {
         ? { vehiclePassengerCapacity }
         : {}),
     };
+    if (req.files?.domicileProof?.[0]) {
+      if (!validDomicile(req.body.domicileAddress, req.body.domicileLatitude, req.body.domicileLongitude)) {
+        return res.status(422).json({ error: 'Indica una dirección válida y marca el domicilio en el mapa.' });
+      }
+      updatedMetadata.domicile = {
+        address: req.body.domicileAddress.trim(),
+        latitude: Number(req.body.domicileLatitude),
+        longitude: Number(req.body.domicileLongitude),
+      };
+    }
+
+    const updatedOcr = { ...(updatedMetadata.ocr || {}) };
+    for (const field of ['licenseFront', 'licenseBack', 'ticPhoto', 'ruatPhoto', 'soatPhoto']) {
+      const file = req.files?.[field]?.[0];
+      if (!file) continue;
+      const image = await sharp(await fs.promises.readFile(file.path)).rotate().png().toBuffer();
+      const read = await ocrService.extractDocument(await preprocessForOcr(image), field);
+      if (read.rejected || read.missing.length) {
+        return res.status(422).json({
+          error: read.rejectReason || `No se pudieron leer los datos obligatorios de ${field}.`,
+        });
+      }
+      updatedOcr[field] = { fields: read.fields, text: read.rawText };
+    }
+    updatedMetadata.ocr = updatedOcr;
+    const front = updatedOcr.licenseFront?.fields || {};
+    const ruat = updatedOcr.ruatPhoto?.fields || {};
+    Object.assign(updatedMetadata, {
+      licenseNumber: front.licenseNumber || updatedMetadata.licenseNumber,
+      licenseExpiryDate: front.licenseExpiryDate || updatedMetadata.licenseExpiryDate,
+      vehiclePlate: ruat.vehiclePlate || updatedMetadata.vehiclePlate,
+      vehicleBrand: ruat.vehicleBrand || updatedMetadata.vehicleBrand,
+      vehicleModel: ruat.vehicleModel || updatedMetadata.vehicleModel,
+      vehicleYear: ruat.vehicleYear || updatedMetadata.vehicleYear,
+      vehicleColor: ruat.vehicleColor || updatedMetadata.vehicleColor,
+    });
 
     console.log('Updated metadata for new request version:', updatedMetadata);
 
-    // Create new request version
-    const newRequest = await DriverRequest.create({
+    const previousDomicile = await DriverDomicile.findOne({ where: { driverRequestId: latestRequest.id } });
+    const nextDomicile = updatedMetadata.domicile || (previousDomicile?.location?.coordinates
+      ? {
+          address: previousDomicile.address,
+          longitude: previousDomicile.location.coordinates[0],
+          latitude: previousDomicile.location.coordinates[1],
+        }
+      : null);
+    if (nextDomicile && !validDomicile(nextDomicile.address, nextDomicile.latitude, nextDomicile.longitude)) {
+      return res.status(422).json({ error: 'El domicilio anterior no es válido. Solicita corregirlo antes de reenviar.' });
+    }
+    if (req.files?.domicileProof?.[0] && !nextDomicile) {
+      return res.status(422).json({ error: 'Falta el domicilio corregido.' });
+    }
+    delete updatedMetadata.domicile;
+
+    // Create new request version and retain the domicile snapshot for this version.
+    const newRequest = await sequelize.transaction(async transaction => {
+      const createdRequest = await DriverRequest.create({
       userId,
       driverId: latestRequest.driverId, // Mantener mismo driverId (null si aún no aprobado)
       version: latestRequest.version + 1,
       status: 'pending',
       metadata: updatedMetadata,
+      }, { transaction });
+      if (nextDomicile) {
+        await DriverDomicile.create({
+          userId,
+          driverRequestId: createdRequest.id,
+          address: nextDomicile.address,
+          location: { type: 'Point', coordinates: [Number(nextDomicile.longitude), Number(nextDomicile.latitude)] },
+        }, { transaction });
+      }
+      return createdRequest;
     });
 
     console.log(`Created new request version: ${newRequest.version}`);
@@ -633,11 +679,13 @@ const resubmitDocuments = async (req, res) => {
         'ciBack',
         'licenseFront',
         'licenseBack',
+        'ticPhoto',
         'antecedentsPhoto',
         'carFront',
         'carBack',
         'soatPhoto',
         'ruatPhoto',
+        'domicileProof',
       ];
 
       for (const field of fileFields) {

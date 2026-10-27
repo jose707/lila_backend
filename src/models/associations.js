@@ -12,6 +12,7 @@ const Rating              = require('./Rating');
 const Vehicle             = require('./Vehicle');
 const DriverLocation      = require('./DriverLocation');
 const DriverRequest       = require('./DriverRequest');
+const DriverDomicile      = require('./DriverDomicile');
 const RequestFile         = require('./RequestFile');
 const Notification        = require('./Notification');
 const CancellationReason  = require('./CancellationReason');
@@ -63,6 +64,10 @@ const setupAssociations = () => {
   DriverRequest.belongsTo(Driver, { foreignKey: 'driverId' });
   User.hasMany(DriverRequest, { foreignKey: 'userId' });
   DriverRequest.belongsTo(User, { foreignKey: 'userId' });
+  User.hasMany(DriverDomicile, { foreignKey: 'userId', as: 'driverDomiciles' });
+  DriverDomicile.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+  DriverRequest.hasOne(DriverDomicile, { foreignKey: 'driverRequestId', as: 'domicile', onDelete: 'CASCADE' });
+  DriverDomicile.belongsTo(DriverRequest, { foreignKey: 'driverRequestId', as: 'request' });
 
   // ─────────────────────────────────────────
   // DRIVER REQUEST ↔ DOCUMENTS

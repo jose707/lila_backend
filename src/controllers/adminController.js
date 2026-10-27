@@ -6,6 +6,7 @@ const Vehicle = require('../models/Vehicle');
 const Ride = require('../models/Ride');
 const Payment = require('../models/Payment');
 const DriverRequest = require('../models/DriverRequest');
+const DriverDomicile = require('../models/DriverDomicile');
 const RequestFile = require('../models/RequestFile');
 const sequelize = require('../config/database');
 const { Op } = require('sequelize');
@@ -115,6 +116,8 @@ const getAllDrivers = async (req, res) => {
         const user = await User.findByPk(request.userId, {
           attributes: { exclude: ['password'] },
         });
+        const identity = await UserIdentity.findOne({ where: { userId: request.userId } });
+        const domicile = await DriverDomicile.findOne({ where: { driverRequestId: request.id } });
 
         const requestFiles = await RequestFile.findAll({
           where: { requestId: request.id },
@@ -178,7 +181,22 @@ const getAllDrivers = async (req, res) => {
 
         return {
           ...request.toJSON(),
-          User: user ? user.toJSON() : null,
+          User: user ? {
+            ...user.toJSON(),
+            name: [identity?.firstNames, identity?.paternalSurname, identity?.maternalSurname]
+              .filter(Boolean).join(' '),
+          } : null,
+          identity: identity ? {
+            ciNumber: identity.ciNumber,
+            birthDate: identity.birthDate,
+            verificationStatus: identity.verificationStatus,
+          } : null,
+          domicile: domicile ? {
+            address: domicile.address,
+            latitude: domicile.location?.coordinates?.[1],
+            longitude: domicile.location?.coordinates?.[0],
+            verificationStatus: domicile.verificationStatus,
+          } : null,
           files,
           vehicle: vehicleData,
           driver: request.driverId ? { id: request.driverId } : null,

@@ -67,7 +67,7 @@ module.exports = {
       `CREATE TYPE audit_action            AS ENUM ('INSERT', 'UPDATE', 'DELETE');`,
     );
     await q(
-      `CREATE TYPE driver_request_status   AS ENUM ('pending', 'approved', 'rejected');`,
+      `CREATE TYPE driver_request_status   AS ENUM ('pending', 'observed', 'approved', 'rejected');`,
     );
     await q(
       `CREATE TYPE ruat_required_reason    AS ENUM ('accident', 'vehicle_mismatch', 'suspension_reactivation', 'criminal_record');`,
@@ -221,7 +221,27 @@ module.exports = {
       );
     `);
 
-    // Archivos vigentes: CI, licencia, antecedentes, RUAT, SOAT y fotos del vehículo.
+    // Archivos vigentes: CI, licencia, TIC, antecedentes, RUAT, SOAT y fotos del vehículo.
+    await q(`
+      CREATE TABLE driver_domiciles (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        driver_request_id UUID NOT NULL UNIQUE REFERENCES driver_requests(id) ON DELETE CASCADE,
+        address VARCHAR(255) NOT NULL,
+        location GEOMETRY(POINT, 4326) NOT NULL,
+        verification_status VARCHAR(20) NOT NULL DEFAULT 'pending'
+          CHECK (verification_status IN ('pending', 'verified', 'rejected')),
+        verified_by UUID REFERENCES users(id),
+        verified_at TIMESTAMPTZ,
+        rejection_reason TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+    await q('CREATE INDEX idx_driver_domiciles_user ON driver_domiciles(user_id);');
+    await q('CREATE INDEX idx_driver_domiciles_location ON driver_domiciles USING GIST(location);');
+
+    // Archivos vigentes: CI, licencia, TIC, antecedentes, RUAT, SOAT y fotos del vehículo.
     await q(`
       CREATE TABLE documents (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -229,7 +249,7 @@ module.exports = {
         driver_request_id UUID REFERENCES driver_requests(id) ON DELETE CASCADE,
         driver_id UUID REFERENCES drivers(id) ON DELETE CASCADE,
         vehicle_id UUID REFERENCES vehicles(id) ON DELETE CASCADE,
-        document_type VARCHAR(40) NOT NULL CHECK (document_type IN ('ciFront', 'ciBack', 'profilePhoto', 'licenseFront', 'licenseBack', 'antecedentsPhoto', 'ruatPhoto', 'soatPhoto', 'carFront', 'carBack', 'carLeft', 'carRight')),
+        document_type VARCHAR(40) NOT NULL CHECK (document_type IN ('ciFront', 'ciBack', 'profilePhoto', 'licenseFront', 'licenseBack', 'ticPhoto', 'antecedentsPhoto', 'ruatPhoto', 'soatPhoto', 'domicileProof', 'carFront', 'carBack', 'carLeft', 'carRight')),
         file_path VARCHAR(500) NOT NULL, original_filename VARCHAR(255), mime_type VARCHAR(100), file_size INTEGER,
         ocr_data JSONB, issued_at DATE, expires_at DATE, is_current BOOLEAN NOT NULL DEFAULT TRUE,
         verification_status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (verification_status IN ('pending', 'verified', 'rejected')),
@@ -900,6 +920,7 @@ module.exports = {
     await q(`DROP TABLE IF EXISTS rides                  CASCADE;`);
     await q(`DROP TABLE IF EXISTS cancellation_reasons   CASCADE;`);
     await q(`DROP TABLE IF EXISTS service_areas          CASCADE;`);
+    await q(`DROP TABLE IF EXISTS driver_domiciles       CASCADE;`);
     await q(`DROP TABLE IF EXISTS driver_requests        CASCADE;`);
     await q(`DROP TABLE IF EXISTS documents              CASCADE;`);
     await q(`DROP TABLE IF EXISTS driver_locations       CASCADE;`);
