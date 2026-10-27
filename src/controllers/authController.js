@@ -6,9 +6,11 @@ const Driver = require('../models/Driver');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const sharp = require('sharp');
+const crypto = require('crypto');
 const ocrService = require('../services/ocrService');
 const { cropForOcr, parseCropRect } = require('../services/documentCrop');
 const { validateIdentity } = require('../services/identityValidation');
+const { inspectMrz } = require('../services/ciMrz');
 const { seal, unseal } = require('../services/identitySessionCrypto');
 const { invokeLambda } = require('../services/faceLivenessLambda');
 
@@ -512,6 +514,37 @@ const verifyLivenessTicket = (ticket, sessionId, userId) => {
   return claims;
 };
 
+const identityImagesHash = (frontImage, backImage) => crypto.createHash('sha256')
+  .update(String(frontImage.length)).update(':').update(frontImage)
+  .update(String(backImage.length)).update(':').update(backImage)
+  .digest('hex');
+
+const issueIdentityOcrTicket = (userId, frontImage, backImage) => jwt.sign(
+  {
+    purpose: 'identity-ci-ocr',
+    imagesHash: identityImagesHash(frontImage, backImage),
+  },
+  getLivenessTicketSecret(),
+  { subject: String(userId), expiresIn: '5m' },
+);
+
+const verifyIdentityOcrTicket = (ticket, userId, frontImage, backImage) => {
+  if (typeof ticket !== 'string' || ticket.length > 2048) {
+    throw Object.assign(new Error('La lectura del CI expiró. Repite la captura.'), { status: 403 });
+  }
+  let claims;
+  try {
+    claims = jwt.verify(ticket, getLivenessTicketSecret());
+  } catch (error) {
+    if (error.status) throw error;
+    throw Object.assign(new Error('La lectura del CI expiró. Repite la captura.'), { status: 403 });
+  }
+  if (claims.purpose !== 'identity-ci-ocr' || claims.sub !== String(userId) ||
+      claims.imagesHash !== identityImagesHash(frontImage, backImage)) {
+    throw Object.assign(new Error('La lectura confirmada no corresponde a estas capturas. Repite la lectura del CI.'), { status: 403 });
+  }
+};
+
 const prepareVerifiedProfilePhoto = async referenceImageBase64 => {
   if (typeof referenceImageBase64 !== 'string' || referenceImageBase64.length > 6 * 1024 * 1024 ||
       !/^[A-Za-z0-9+/]+={0,2}$/.test(referenceImageBase64)) {
@@ -547,10 +580,78 @@ const saveVerifiedProfilePhoto = async (user, image, transaction) => {
   await user.update({ profilePhoto: `/api/users/${user.id}/profile-photo` }, { transaction });
 };
 
+/** Validate CI images before face liveness; OCR remains server-side. */
+const verifyIdentityOcr = async (req, res) => {
+  try {
+    const { consent } = req.body || {};
+    const frontImage = req.files?.ciFront?.[0]?.buffer;
+    const backImage = req.files?.ciBack?.[0]?.buffer;
+    if (consent !== 'true' && consent !== true) {
+      return res.status(400).json({ error: 'Debes autorizar el tratamiento de los documentos para verificar tu identidad.' });
+    }
+    if (!frontImage || !backImage) {
+      return res.status(400).json({ error: 'Envía el frente y reverso de la cédula para leer el CI.' });
+    }
+    const existingIdentity = await UserIdentity.findOne({ where: { userId: req.user.id } });
+    if (existingIdentity?.verificationStatus === 'verified') {
+      return res.status(409).json({ error: 'La identidad ya está verificada.' });
+    }
+    const extract = async (image, side) => {
+      let normalized = await sharp(image, { limitInputPixels: 24000000 }).rotate().toBuffer();
+      const cropRect = parseCropRect(req.body, side);
+      if (cropRect) normalized = await cropForOcr(normalized, cropRect, 0.05);
+      normalized = await sharp(normalized).grayscale().normalize().png().toBuffer();
+      const result = await ocrService.extractDocument(normalized, side);
+      if (result.rejected) {
+        throw Object.assign(new Error(result.rejectReason || `No se reconoce el lado ${side} de la cédula.`), { status: 422 });
+      }
+      return result;
+    };
+    const [front, back] = await Promise.all([
+      extract(frontImage, 'ciFront'),
+      extract(backImage, 'ciBack'),
+    ]);
+    const ciFormat = back.classify?.hasMRZ ? 'current' : 'legacy';
+    front.fields = ocrService.parseCI(front.rawText, {
+      documentType: 'ciFront', words: front.words, format: ciFormat,
+    });
+    back.fields = ocrService.parseCI(back.rawText, {
+      documentType: 'ciBack', words: back.words, format: ciFormat,
+    });
+
+    let mrzComparison = 'not_applicable';
+    if (ciFormat === 'current') {
+      const mrz = inspectMrz(back.rawText);
+      if (mrz.status !== 'valid') {
+        mrzComparison = mrz.status === 'unsupported' ? 'unsupported' : mrz.status;
+        res.set('Cache-Control', 'no-store');
+        return res.json({ mrzComparison });
+      }
+      const birthMatch = String(front.fields.birthDate || '').match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+      const birthYYMMDD = birthMatch ? `${birthMatch[3].slice(2)}${birthMatch[2]}${birthMatch[1]}` : null;
+      if (mrz.documentNumber !== front.fields.ciNumber || mrz.birth !== birthYYMMDD) {
+        res.set('Cache-Control', 'no-store');
+        return res.json({ mrzComparison: 'mismatch' });
+      }
+      mrzComparison = 'match';
+    }
+
+    validateIdentity(front, back);
+    const ocrTicket = issueIdentityOcrTicket(req.user.id, frontImage, backImage);
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ocrTicket, mrzComparison });
+  } catch (error) {
+    console.error('Error reading identity document:', error.name || 'Error');
+    return res.status(error.status || 500).json({
+      error: error.status ? error.message : 'No se pudo leer el CI. Intenta nuevamente.',
+    });
+  }
+};
+
 /** Process both CI images together; OCR data is never accepted from the app. */
 const verifyIdentity = async (req, res) => {
   try {
-    const { consent, livenessSessionId, livenessTicket } = req.body || {};
+    const { consent, livenessSessionId, livenessTicket, ocrTicket } = req.body || {};
     const frontImage = req.files?.ciFront?.[0]?.buffer;
     const backImage = req.files?.ciBack?.[0]?.buffer;
     const selfieImage = req.files?.selfie?.[0]?.buffer;
@@ -558,6 +659,7 @@ const verifyIdentity = async (req, res) => {
     if (consent !== 'true' && consent !== true) return res.status(400).json({ error: 'Debes autorizar el tratamiento de los documentos para verificar tu identidad.' });
     if (!frontImage || !backImage) return res.status(400).json({ error: 'Envía el frente y reverso de la cédula para completar el registro.' });
     if (!selfieImage && !livenessEnabled) return res.status(400).json({ error: 'Envía una selfie para completar el registro.' });
+    if (livenessEnabled && ocrTicket) verifyIdentityOcrTicket(ocrTicket, req.user.id, frontImage, backImage);
     const extract = async (image, side) => {
       let normalized = await sharp(image, { limitInputPixels: 24000000 }).rotate().toBuffer();
       const cropRect = parseCropRect(req.body, side);
@@ -784,6 +886,7 @@ module.exports = {
   googleAuth,
   checkFirebaseUser,
   verifyPhoneOTP,
+  verifyIdentityOcr,
   verifyIdentity,
   startFaceLiveness,
   completeFaceLiveness,

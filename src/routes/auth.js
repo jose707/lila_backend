@@ -29,6 +29,15 @@ router.post('/google', authController.googleAuth);
 router.post('/verify-phone', authController.verifyPhoneOTP);
 
 router.post(
+  '/verify-identity/ocr',
+  authMiddleware,
+  identityVerificationEnabled,
+  faceLivenessEnabled,
+  identityUpload,
+  authController.verifyIdentityOcr,
+);
+
+router.post(
   '/verify-identity',
   authMiddleware,
   identityVerificationEnabled,
