@@ -641,7 +641,11 @@ const verifyIdentityOcr = async (req, res) => {
     res.set('Cache-Control', 'no-store');
     return res.json({ ocrTicket, mrzComparison });
   } catch (error) {
-    console.error('Error reading identity document:', error.name || 'Error');
+    console.error('Error reading identity document:', {
+      name: error.name || 'Error',
+      status: error.status || 500,
+      message: String(error.message || '').slice(0, 300),
+    });
     return res.status(error.status || 500).json({
       error: error.status ? error.message : 'No se pudo leer el CI. Intenta nuevamente.',
     });
@@ -765,7 +769,11 @@ const verifyIdentity = async (req, res) => {
     res.set('Cache-Control', 'no-store');
     res.json({ message: livenessEnabled ? 'CI validado, prueba de vida y comparación facial aprobados.' : 'CI validado y rostro comparado con la selfie.', user: await buildUserResponseObject(user) });
   } catch (error) {
-    console.error('Error verifying identity:', error.name);
+    console.error('Error verifying identity:', {
+      name: error.name || 'Error',
+      status: error.status || 500,
+      message: String(error.message || '').slice(0, 300),
+    });
     const duplicate = error.name === 'SequelizeUniqueConstraintError';
     res.status(error.status || (duplicate ? 409 : 500)).json({ error: error.status ? error.message : duplicate ? 'La cédula ya está registrada.' : 'No se pudo guardar la identidad. Intenta nuevamente.' });
   }
