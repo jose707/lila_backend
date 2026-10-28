@@ -36,6 +36,12 @@ function validateIdentity(front, back, today = new Date().toISOString().slice(0,
     const missing = fields.filter(key => !String(side?.[key] || '').trim());
     if (missing.length) fail(`No se pudieron leer estos datos del lado ${sideName}: ${missing.map(key => fieldNames[key]).join(', ')}. Repite esa captura con buena luz y el documento completo.`);
   }
+  const compactName = [f.firstNames, f.surnames || [f.paternalSurname, f.maternalSurname].filter(Boolean).join(' ')]
+    .filter(Boolean).join(' ').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/[^A-Z]/g, '');
+  const documentHeaderFragments = ['ESTADOPLURINACIONAL', 'PLURINACIONAL', 'BOLIVIA', 'SERVICIOGENERAL', 'IDENTIFICACION', 'CEDULA'];
+  if (documentHeaderFragments.some(fragment => compactName.includes(fragment))) {
+    fail('La lectura mezcló el nombre con texto del encabezado de la cédula. Repite la captura frontal.');
+  }
   const mrz = require('./ciMrz').inspectMrz(back.rawText);
   if (mrz.status === 'invalid') fail('La zona MRZ tiene dígitos de control incorrectos. Repite la foto posterior.');
   const name = value => String(value).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().split(/\s+/).filter(Boolean).sort().join(' ');
