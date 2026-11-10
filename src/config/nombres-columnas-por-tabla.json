@@ -1,0 +1,107 @@
+{
+  "usuario": {
+    "id": "id_usuario"
+  },
+  "documento_ci": {
+    "id": "id_documento_ci",
+    "usuario_id": "id_usuario",
+    "verificado_por": "id_usuario_verificador"
+  },
+  "conductor": {
+    "id": "id_conductor",
+    "usuario_id": "id_usuario"
+  },
+  "solicitud_conductor": {
+    "id": "id_solicitud_conductor",
+    "usuario_id": "id_usuario"
+  },
+  "documento_domicilio": {
+    "id": "id_documento_domicilio",
+    "usuario_id": "id_usuario",
+    "solicitud_conductor_id": "id_solicitud_conductor",
+    "verificado_por": "id_usuario_verificador"
+  },
+  "vehiculo": {
+    "id": "id_vehiculo",
+    "conductor_id": "id_conductor"
+  },
+  "documento": {
+    "id": "id_documento",
+    "usuario_id": "id_usuario",
+    "solicitud_conductor_id": "id_solicitud_conductor",
+    "conductor_id": "id_conductor",
+    "vehiculo_id": "id_vehiculo",
+    "verificado_por": "id_usuario_verificador"
+  },
+  "ubicacion_conductor": {
+    "conductor_id": "id_conductor"
+  },
+  "viaje": {
+    "id": "id_viaje",
+    "pasajero_id": "id_pasajero",
+    "conductor_id": "id_conductor",
+    "zona_servicio_id": "id_zona_servicio",
+    "motivo_cancelacion_id": "id_motivo_cancelacion"
+  },
+  "oferta_viaje": {
+    "id": "id_oferta_viaje",
+    "viaje_id": "id_viaje",
+    "conductor_id": "id_conductor"
+  },
+  "parada_viaje": {
+    "id": "id_parada_viaje",
+    "viaje_id": "id_viaje"
+  },
+  "pago": {
+    "id": "id_pago",
+    "viaje_id": "id_viaje"
+  },
+  "calificacion": {
+    "id": "id_calificacion",
+    "viaje_id": "id_viaje"
+  },
+  "cobros_conductor": {
+    "id": "id_ganancia_conductor",
+    "viaje_id": "id_viaje",
+    "liquidacion_id": "id_comision"
+  },
+  "comision": {
+    "id": "id_comision",
+    "conductor_id": "id_conductor"
+  },
+  "zona_servicio": {
+    "id": "id_zona_servicio"
+  },
+  "motivo_cancelacion": {
+    "id": "id_motivo_cancelacion"
+  },
+  "regla_tarifa": {
+    "id": "id_regla_tarifa"
+  },
+  "notificacion": {
+    "id": "id_notificacion",
+    "usuario_id": "id_usuario",
+    "type": "tipo"
+  },
+  "registro_auditoria": {
+    "id": "id_registro_auditoria",
+    "registro_id": "id_registro_afectado",
+    "modificado_por": "id_usuario_responsable",
+    "modificado_en": "realizado_en"
+  },
+  "contacto_emergencia": {
+    "id": "id_contacto_emergencia",
+    "usuario_id": "id_usuario"
+  },
+  "alerta_emergencia": {
+    "id": "id_alerta_emergencia",
+    "usuario_id": "id_usuario",
+    "viaje_id": "id_viaje",
+    "resuelta_por": "id_usuario_resolutor"
+  },
+  "registro_sms_emergencia": {
+    "id": "id_registro_sms_emergencia",
+    "alerta_id": "id_alerta",
+    "contacto_id": "id_contacto"
+  }
+}

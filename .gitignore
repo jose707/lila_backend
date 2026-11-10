@@ -37,6 +37,8 @@ Thumbs.db
 # Service account keys
 *.json
 !aws/api-face-liveness/package.json
+!src/config/nombres-esquema.json
+!src/config/nombres-columnas-por-tabla.json
 
 # Fotos reales de pruebas (NO se suben al repo)
 dev-assets/
