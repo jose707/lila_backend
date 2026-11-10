@@ -1,0 +1,50 @@
+// Script para sincronizar la BD con los modelos
+// Uso: node src/scripts/sincronizarDatabase.js
+
+const sequelize = require("../config/baseDatos");
+
+// Importar modelos
+const Usuario = require("../models/Usuario");
+const Conductor = require("../models/Conductor");
+const Viaje = require("../models/Viaje");
+const ConductorSolicitud = require("../models/ConductorSolicitud");
+const SolicitudArchivo = require("../models/SolicitudArchivo");
+const UsuarioIdentidad = require("../models/UsuarioIdentidad");
+const Vehiculo = require("../models/Vehiculo");
+
+// Importar asociaciones
+const configurarAsociaciones = require('../models/associations');
+configurarAsociaciones();
+
+const sincronizarBaseDatos = async () => {
+  try {
+    console.log('🔄 Sincronizando BD con los modelos...');
+
+    // ⚠️  ADVERTENCIA: sync({ alter: true }) puede generar constraints UNIQUE
+    //     duplicadas si se ejecuta más de una vez (bug conocido de Sequelize).
+    //     Los modelos ahora usan nombres explícitos de constraint para mitigar
+    //     esto, pero la práctica recomendada es usar SOLO migraciones para
+    //     cambios de esquema en producción y NO correr este script.
+    await sequelize.sync({
+      alter: true,
+      logging: console.log
+    });
+
+    console.log('✅ BD sincronizada exitosamente');
+    console.log('📋 Tablas creadas/actualizadas:');
+    console.log('  - users');
+    console.log('  - drivers');
+    console.log('  - rides');
+    console.log('  - driver_requests');
+    console.log('  - user_identities');
+    console.log('  - vehicles');
+    console.log('  - documents');
+
+    process.exit(0);
+  } catch (error) {
+    console.error('❌ Error sincronizando BD:', error);
+    process.exit(1);
+  }
+};
+
+sincronizarBaseDatos();

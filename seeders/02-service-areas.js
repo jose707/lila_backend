@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Seeder: Zonas de servicio (service_areas)
+ * Zonas de servicio de ejemplo.
  *
  * Define los polígonos geográficos de las ciudades donde opera la app.
  * Las coordenadas son ejemplos representativos de Bolivia.
@@ -9,15 +9,15 @@
  * ⚠️  Ajusta las coordenadas de los polígonos a la ciudad real
  *     usando geojson.io para dibujar las zonas exactas.
  *
- * Corre con: npx sequelize-cli db:seed --seed 02-service-areas.js
+ * Ejecutar desde backend con npm run seed:zonas.
  */
 module.exports = {
   async up(queryInterface) {
     // Insertar con ST_GeomFromText porque Sequelize no puede insertar
     // geometrías PostGIS directamente en bulkInsert
-    await queryInterface.sequelize.query(`
-      INSERT INTO service_areas
-        (id, name, boundary, is_active, base_fare, fare_per_km, fare_per_minute, currency, created_at, updated_at)
+    const [filasInsertadas] = await queryInterface.sequelize.query(`
+      INSERT INTO public.zona_servicio
+        (id_zona_servicio, nombre, limite, activo, tarifa_base, tarifa_km, tarifa_minuto, moneda, creado_en, actualizado_en)
       VALUES
       (
         '22222222-0002-0002-0002-000000000001',
@@ -78,11 +78,33 @@ module.exports = {
           -67.1300 -17.9500
         ))', 4326),
         true, 6.0, 2.2, 0.4, 'BOB', NOW(), NOW()
-      );
-    `);
+      )
+      ON CONFLICT (id_zona_servicio) DO NOTHING
+      RETURNING id_zona_servicio;
+    `, { esquemaFisico: true });
+    return filasInsertadas.length;
   },
 
   async down(queryInterface) {
-    await queryInterface.bulkDelete('service_areas', null, {});
+    await queryInterface.sequelize.query(`
+      DELETE FROM public.zona_servicio WHERE id_zona_servicio IN (
+        '22222222-0002-0002-0002-000000000001',
+        '22222222-0002-0002-0002-000000000002',
+        '22222222-0002-0002-0002-000000000003',
+        '22222222-0002-0002-0002-000000000004',
+        '22222222-0002-0002-0002-000000000005'
+      );
+    `, { esquemaFisico: true });
   },
 };
+
+if (require.main === module) {
+  const db = require('../src/config/baseDatos');
+  module.exports.up(db.getQueryInterface())
+    .then(cantidad => console.log(`Zonas de ejemplo insertadas: ${cantidad}.`))
+    .catch(error => {
+      console.error('No se pudieron cargar las zonas:', error.message);
+      process.exitCode = 1;
+    })
+    .finally(() => db.close());
+}

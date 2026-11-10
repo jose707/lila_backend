@@ -1,1316 +1,1272 @@
-# Documentación de Base de Datos — App de Transporte tipo InDrive
+# Base de datos de Línea Lila
 
-> PostgreSQL con extensión PostGIS | ORM: Sequelize
+Esquema para instalación nueva, definido íntegramente en `migrations/00000000-initial-schema.js`. La instalación se ejecuta en una transacción: si falla, no deja una instalación parcial. No contiene migraciones posteriores de renombrado ni columnas JSON/JSONB.
 
-`migrations/00000000-initial-schema.js` es la migración maestra y crea el esquema completo para una instalación nueva, incluidas las reglas de asignación rápida. `migrate.js` la ejecuta una sola vez y se detiene si encuentra tablas existentes de la aplicación. En una base existente, `npm run migrate:remove-retired` actualiza el esquema anterior. El OCR de CI se procesa en una sola solicitud. El esquema de CI no incluye tablas de sesión OCR o revisión manual, apellidos combinados ni un estado separado de aprobación documental.
+## Instalación
 
----
+Configurar PostgreSQL con PostGIS y una base vacía en las variables DB_*. Desde backend ejecutar `npm run migrate`. El comando rechaza una base con tablas de la aplicación; no elimina la base existente.
 
-## Índice
+Los campos no reconocidos por OCR se calculan al consultar los datos extraídos y sus requisitos; no se guardan en una tabla adicional.
 
-1. [Visión general](#visión-general)
-2. [Diagrama de relaciones](#diagrama-de-relaciones)
-3. [Tablas principales](#tablas-principales)
-4. [Tablas de soporte](#tablas-de-soporte)
-5. [Tablas de configuración](#tablas-de-configuración)
-6. [Tablas del sistema](#tablas-del-sistema)
-7. [ENUMs](#enums)
-8. [Índices](#índices)
-9. [Constraints](#constraints)
-10. [Triggers](#triggers)
-11. [Campos calculados](#campos-calculados)
-12. [Flujos principales](#flujos-principales)
+Las características del vehículo se guardan exclusivamente en documento_ruat. Una renovación pendiente conserva el RUAT aprobado anterior como fuente; al aprobar el nuevo, se conserva el anterior como historial.
 
----
+El conductor de una ganancia se obtiene mediante id_viaje y el método mediante ese viaje. Las fechas de emisión y vencimiento se guardan en las tablas específicas del documento; documento no contiene fechas generales de emisión ni vencimiento.
 
-## Visión general
+## Reglas del modelo
 
-La base de datos soporta una aplicación de transporte donde pasajeros solicitan viajes, conductores hacen ofertas con su precio, y el pasajero acepta la oferta que prefiera (modelo InDrive).
+- Un usuario no puede repetir un teléfono entre sus contactos de emergencia activos, aunque cambie el nombre o el formato del número. La unicidad se comprueba usando sus dígitos. Los contactos eliminados quedan inactivos como historial y se permite volver a registrar ese número. Usuarios distintos pueden compartir un contacto.
 
-**Características clave del modelo de negocio:**
-- Los pagos son únicamente en **efectivo o QR directo al conductor**
-- La plataforma **no intermedia el dinero**, solo cobra su comisión
-- Las comisiones se acumulan por viaje y se cobran **una vez al mes** mediante un settlement
-- Si el conductor no paga antes de la fecha límite, su cuenta puede bloquearse
-- Un mismo usuario puede tener rol de pasajero y conductor simultáneamente
+- `solicitud_conductor.estado_ocr` distingue `pendiente`, `complete` (sin errores técnicos, aunque falten campos) y `fallido` (al menos un error técnico). `ocr_procesado_en` registra cuándo terminó el intento, incluso si falló. Se conservan las lecturas disponibles. Los reenvíos registran el resultado de los archivos nuevos y conservan los documentos aprobados; los fallidos no se reprocesan automáticamente al reiniciar.
 
----
+- Las tablas específicas usan `id_documento_ci`, `id_documento_licencia`, `id_documento_ruat`, `id_documento_soat`, `id_documento_tic`, `id_documento_antecedentes`, `id_documento_domicilio` e `id_documento_informe_psicologico` como clave primaria y foránea a `documento.id_documento`. Conservan el mismo UUID del documento general.
 
-## Diagrama de relaciones
+- El texto de identidad se conserva en `consentimientos/identity-documents-v1.txt`. `GET /autenticacion/verificar-identidad/consentimiento` entrega `version` y `texto`; la app muestra ese texto y envía `consentVersion` al aceptar. El backend valida la versión tanto en OCR como al confirmar, la vincula al ticket OCR y la registra en `documento.consentimiento_version`. `consentimiento_en` usa la fecha del servidor al guardar la verificación. Las versiones publicadas no se modifican: se conservan sus archivos y se publica una nueva versión para cambiar el texto.
 
-```
-users ──────────────────── drivers ──────── vehicles
-  │                           │
-  ├── user_identities          ├── documents
-  ├── documents ───────────────┘
-  │                           ├── driver_locations
-  │                           ├── driver_domiciles
-  │                           ├── driver_requests ── documents
-  │                           ├── driver_earnings ── commission_settlements
-  │                           └── ride_offers
-  ├────── rides ───────────────────────┤
-  │          │                          │
-  │          ├── ride_waypoints
-  │          ├── ride_offers ───────────┘
-  │          ├── payments
-  │          ├── ratings
-  │          ├── driver_earnings
-  │          ├── cancellation_reasons (FK)
-  │          └── service_areas (FK)
-  │
-  ├── emergency_contacts
-  └── emergency_alerts ── emergency_sms_logs
-                └──────── emergency_recordings
+- Los adjuntos de CI, solicitud y renovación incluyen un campo por archivo, por ejemplo `licenseFrontOrigen`: `captura_camara` o `archivo_subido`. El backend exige y valida el valor declarado por la app. `prueba_vida` y `semilla_desarrollo` se asignan desde el servidor. Los documentos reutilizados conservan su origen; los registros sin archivo pueden tener origen NULL.
+- El tamaño del archivo no se almacena en `documento`; los límites de carga se validan al recibir el archivo.
+- `documento` guarda la imagen definitiva recortada, la evidencia cifrada cuando corresponde y el texto extraído por OCR. Los errores técnicos se registran en los logs del servidor; la decisión de revisión se guarda en `estado_verificacion` y `motivo_rechazo`. El recorte se aplica una sola vez al recibir la captura; no se guardan coordenadas. OCR y revisión de conductor leen el mismo archivo JPEG. El CI conserva la imagen recortada en color y cifrada; el tratamiento de OCR se aplica sobre esa imagen. Sus propietarios se enlazan mediante `usuario_documento`, `conductor_documento` o `vehiculo_documento`. Solo puede tener una de esas clases de propietario.
+- `solicitud_documento` registra qué documentos se presentaron en cada solicitud; la verificación se guarda únicamente en documento. Una versión posterior de solicitud reutiliza los documentos ya aprobados. Las renovaciones generan documentos nuevos y conservan los anteriores.
+- `documento_ci` reemplaza identidad_usuario y contiene los datos oficiales del CI. `documento_domicilio` reemplaza domicilio_conductor y reúne dirección declarada, ubicación y comprobante. Los campos detectados por OCR son observaciones del documento presentado, no otra identidad oficial. El número de licencia del perfil se obtiene del CI; los números detectados se usan para comprobar coincidencias.
+- La revisión documental debe completarse antes de programar la evaluación psicológica. Solo una evaluación realizada con informe apto y vigente permite la aprobación final y creación de conductor y vehículo.
+- `comision` agrupa las comisiones de un conductor por mes calendario. `pago_comision` conserva intentos pendientes, rechazados y confirmados. Solo se acepta el importe mensual completo y una confirmación por comisión. El comprobante es `id_documento_comprobante`, no otra tabla.
+- `registro_auditoria_detalle` guarda un campo por fila y valores escalares TEXT. INSERT: anterior NULL; DELETE: nuevo NULL; UPDATE: campos modificados. El identificador afectado no tiene FK al registro original. Un borrado lógico se registra como actualización de eliminado_en.
+- `notificacion` contiene acción y un destino opcional mediante FK. Los objetos de respuesta o de FCM se construyen en memoria; no son columnas JSON.
+- `regla_tarifa.dia_semana` tiene un único SMALLINT entre 0 (domingo) y 6 (sábado), o NULL para todos los días. Jueves y domingo pueden tener reglas distintas.
+- `pago` obtiene el pasajero mediante `id_viaje`; no repite `id_pasajero`.
+- `calificacion` obtiene conductor y pasajero mediante el viaje y es única por viaje y tipo de calificador.
 
-notifications ──── users
-service_areas (zonas geográficas de operación — PostGIS)
-pricing_rules (multiplicadores por zona/hora — PostGIS)
-audit_logs (registra cambios en tablas críticas)
-```
+La tasa se administra mediante GET /administracion/zonas-servicio y PUT /administracion/zonas-servicio/:zoneId/tasa-comision, con cuerpo {"tasa_comision":0.03} para 3 %. Ambas rutas requieren administrador. Los cambios quedan registrados en auditoría. COMMISSION_RATE del entorno ya no determina las comisiones.
 
----
+Si aún no existen zonas, pueden cargarse las zonas de desarrollo con npm run seed:zonas desde backend.
 
-## Tablas principales
+## API añadida
 
-### `users`
-Todos los usuarios de la app, tanto pasajeros como conductores. Un mismo usuario puede tener ambos roles.
+Rutas protegidas de administración:
 
-| Columna | Tipo | Nulo | Default | Descripción |
-|---|---|---|---|---|
-| `id` | UUID | NO | | Identificador único |
-| `firebase_uid` | VARCHAR | NO | | ID de autenticación Firebase |
-| `fcm_token` | VARCHAR | YES | | Firebase Device Token para Notificaciones Push |
-| `email` | VARCHAR | YES | | Correo electrónico |
-| `phone` | VARCHAR | YES | | Teléfono |
-| `password` | VARCHAR | YES | | Contraseña hasheada |
-| `role` | ENUM | NO | | `passenger`, `driver`, `admin` |
-| `current_mode` | VARCHAR | YES | | Modo activo si el usuario tiene doble rol |
-| `profile_photo` | VARCHAR | YES | | Ruta autenticada de la foto obtenida en Face Liveness (`/api/users/:id/profile-photo`) después de verificar la identidad |
-| `is_active` | BOOLEAN | NO | true | Si la cuenta está activa |
-| `phone_verified` | BOOLEAN | NO | false | Si el número de celular fue validado mediante OTP |
-| `last_login` | TIMESTAMPTZ | YES | | Último inicio de sesión |
-| `deleted_at` | TIMESTAMPTZ | YES | | Soft delete — no se borra físicamente |
-| `created_at` | TIMESTAMPTZ | NO | | Fecha de creación |
-| `updated_at` | TIMESTAMPTZ | NO | | Fecha de última modificación |
+- PUT /administracion/solicitudes/:requestId/documentos/aprobar, con verifiedDocuments.
+- GET y POST /administracion/solicitudes/:requestId/evaluaciones; POST recibe programadaEn.
+- POST /administracion/solicitudes/:requestId/evaluaciones/:evaluationId/informe, multipart: informe PDF, resultado, fechaEmision, validaHasta opcional y numeroInforme opcional.
+- GET en la misma ruta del informe para descargarlo.
+- PUT /administracion/solicitudes/:requestId/aprobar, aprobación final.
+- GET /administracion/documentos/pendientes y PUT /administracion/documentos/:documentId/revisar, con estado verificado/rechazado y motivo cuando se rechaza.
 
-> ⚠️ `total_trips` fue eliminado — se calcula con `SELECT COUNT(*) FROM rides WHERE passenger_id = ?`
->
-> ⚠️ `users` no guarda nombre ni estado de identidad. Para mostrar el nombre y validar identidad se consulta `user_identities`.
+Renovación autenticada: POST /conductores/renovar-documentos, multipart con los mismos nombres de archivos de registro. Para licencia se requieren ambas caras; para domicilio, dirección y coordenadas; vehicleId selecciona un vehículo propio. /conductores/enviar-ruat utiliza el mismo flujo.
 
----
+## Tablas físicas (36)
 
-### `user_identities`
+Los importes, método y fecha del pago confirmado se obtienen de pago_comision. Los datos SOAT se consultan desde documento_soat mediante vehiculo_documento. La verificación de CI, RUAT, SOAT y demás documentos se almacena únicamente en documento. El estado y la fecha de cobro de una ganancia se obtienen mediante su comisión y el pago confirmado. Las vistas calculan estos datos al consultar; no se duplican como columnas físicas.
 
-Datos oficiales de la cédula. Tiene una relación 1:1 con `users`; se mantiene fuera de `users` porque es información sensible.
+### alerta_emergencia
 
-| Columna | Tipo | Nulo | Descripción |
+| Columna | Tipo | Nulo | Predeterminado |
 |---|---|---|---|
-| `id` | UUID | NO | Identificador |
-| `user_id` | UUID | NO | FK única → `users` |
-| `first_names` | VARCHAR(150) | NO | Nombres |
-| `paternal_surname` | VARCHAR(100) | YES | Apellido paterno |
-| `maternal_surname` | VARCHAR(100) | YES | Apellido materno |
-| `ci_number` | VARCHAR(20) | NO | Número de CI, único |
-| `birth_date`, `issue_date`, `expiry_date` | DATE | | Fechas del CI |
-| `birth_place`, `address`, `occupation` | VARCHAR | YES | Datos personales extraídos |
-| `marital_status`, `blood_type` | VARCHAR | YES | Estado civil y grupo sanguíneo |
-| `verification_status` | VARCHAR(20) | NO | `pending`, `verified`, `rejected` |
-| `verified_at`, `verified_by`, `rejection_reason` | TIMESTAMPTZ/UUID/TEXT | YES | Resultado de verificación |
+| id_alerta_emergencia | uuid | No | uuid_generate_v4() |
+| id_usuario | uuid | No |  |
+| id_viaje | uuid | Sí |  |
+| estado | emergencia_alerta_estado | No | 'activo'::emergencia_alerta_estado |
+| ubicacion | geometry(Point,4326) | Sí |  |
+| direccion_ubicacion | text | Sí |  |
+| activada_en | timestamp with time zone | No | now() |
+| resuelta_en | timestamp with time zone | Sí |  |
+| id_usuario_resolutor | uuid | Sí |  |
+| notas | text | Sí |  |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | No | now() |
 
-La identidad solo pasa a `verified` después de que el OCR valida los campos requeridos, Face Liveness supera su umbral y Rekognition compara su imagen de referencia con el rostro del frente del CI. El OCR admite la CI actual y la anterior: en la anterior los nombres se leen tras `A:`, el nacimiento tras `Nacido el` y el lugar de nacimiento tras `EN` en el reverso; las fechas impresas con meses en letras se normalizan antes de validar. El lugar de nacimiento es obligatorio para ambos formatos. No se exige MRZ en el diseño anterior. Las dos imágenes del CI y una versión reducida de la foto de referencia se conservan cifradas tras la aprobación.
+Restricciones:
 
-El registro actual envía ambas caras del CI y el identificador de la prueba de vida al backend en una sola solicitud. El servidor obtiene el resultado y la foto de referencia directamente de la Lambda; la app no envía una selfie separada. La foto de referencia aprobada se guarda como documento `profilePhoto` cifrado y se sirve solo mediante una ruta autenticada.
+- `CHECK ((((estado <> 'resuelto'::emergencia_alerta_estado) AND (resuelta_en IS NULL)) OR ((estado = 'resuelto'::emergencia_alerta_estado) AND (resuelta_en IS NOT NULL))))`
+- `FOREIGN KEY (id_usuario) REFERENCES usuario(id_usuario)`
+- `FOREIGN KEY (id_usuario_resolutor) REFERENCES usuario(id_usuario)`
+- `FOREIGN KEY (id_viaje) REFERENCES viaje(id_viaje)`
+- `NOT NULL activada_en`
+- `NOT NULL actualizado_en`
+- `NOT NULL creado_en`
+- `NOT NULL estado`
+- `NOT NULL id_alerta_emergencia`
+- `NOT NULL id_usuario`
+- `PRIMARY KEY (id_alerta_emergencia)`
 
-El registro envía ambas imágenes juntas. El OCR y la validación se ejecutan antes de guardar; si todos los campos requeridos son válidos, la identidad y las referencias cifradas de documentos se guardan en una transacción. No existe guardado de borradores OCR en la base de datos.
+Índices:
 
----
+```sql
+CREATE UNIQUE INDEX alerta_emergencia_pkey ON public.alerta_emergencia USING btree (id_alerta_emergencia);
+CREATE INDEX idx_alerta_emergencia_estado ON public.alerta_emergencia USING btree (estado);
+CREATE INDEX idx_alerta_emergencia_geografico ON public.alerta_emergencia USING gist (ubicacion);
+CREATE INDEX idx_alerta_emergencia_usuario ON public.alerta_emergencia USING btree (id_usuario);
+CREATE INDEX idx_alerta_emergencia_viaje ON public.alerta_emergencia USING btree (id_viaje);
+```
 
-### `drivers`
-Perfil del conductor vinculado a un `user`. Solo existe si el usuario solicitó y fue aprobado como conductor.
+### calificacion
 
-| Columna | Tipo | Nulo | Default | Descripción |
-|---|---|---|---|---|
-| `id` | UUID | NO | | Identificador único |
-| `user_id` | UUID | NO | | FK → users |
-| `license_number` | VARCHAR | YES | | Número de licencia; debe coincidir con el CI |
-| `license_nationality` | VARCHAR | YES | | Nacionalidad impresa en la licencia |
-| `license_issue_date`, `license_expiry` | DATE | YES | | Emisión y vencimiento |
-| `license_category` | VARCHAR(20) | YES | | Categoría de conducir |
-| `license_wears_glasses`, `license_uses_hearing_aid` | BOOLEAN | YES | | Restricciones indicadas en la licencia |
-| `license_verification_status`, `license_verified_at` | VARCHAR/TIMESTAMPTZ | NO/YES | | Estado y fecha de revisión |
-| `status` | ENUM | NO | | `pending`, `approved`, `rejected`, `suspended` |
-| `is_available` | BOOLEAN | NO | false | Si está disponible para recibir viajes |
-| `rejection_reason` | VARCHAR | YES | | Razón si fue rechazado |
-| `deleted_at` | TIMESTAMPTZ | YES | | Soft delete |
-| `created_at` | TIMESTAMPTZ | NO | | Fecha de creación |
-| `updated_at` | TIMESTAMPTZ | NO | | Fecha de última modificación |
-
-> ⚠️ Los siguientes campos **no son columnas físicas** — se calculan en tiempo de ejecución:
-> - `rating` → promedio calculado desde la tabla `ratings` (`WHERE rater_type = 'passenger'`)
-> - `total_trips_as_driver` → `COUNT(*)` desde `rides` (`WHERE driver_id = ? AND status = 'completed'`)
-> - `total_earnings` → `SUM(net_amount)` desde `driver_earnings`
-
----
-
-### `vehicles`
-Vehículo(s) registrado(s) por el conductor. Un conductor puede tener múltiples vehículos pero solo uno activo.
-
-| Columna | Tipo | Nulo | Default | Descripción |
-|---|---|---|---|---|
-| `id` | UUID | NO | | Identificador único |
-| `driver_id` | UUID | NO | | FK → drivers |
-| `brand` | VARCHAR | NO | | Marca del vehículo |
-| `model` | VARCHAR | NO | | Modelo del vehículo |
-| `year` | INTEGER | NO | | Año de fabricación |
-| `color` | VARCHAR | YES | | Color |
-| `plate` | VARCHAR | NO | | Placa — UNIQUE |
-| `capacity` | INTEGER | NO | 4 | Número de pasajeros |
-| `vehicle_type` | ENUM | NO | `taxi` | `taxi`, `minibus`, `bus`, `motorcycle` |
-| `registration_municipality`, `crpva_number` | VARCHAR | YES | | Radicatoria y código CRPVA del RUAT |
-| `ruat_issue_date`, `ownership_start_date` | DATE | YES | | Emisión del RUAT e inicio de la propiedad actual |
-| `door_count`, `service_type` | INTEGER/VARCHAR | YES | | Número de puertas y tipo de servicio declarado |
-| `chassis_number`, `engine_number` | VARCHAR | YES | | Identificadores técnicos del vehículo |
-| `fuel_type`, `engine_displacement`, `engine_type` | VARCHAR | YES | | Combustible, cilindrada y tipo de motor |
-| `legal_observations` | TEXT | YES | | Restricciones u observaciones legales del RUAT |
-| `status` | ENUM | NO | `active` | `active`, `inactive`, `suspended` |
-| `ruat_file` | VARCHAR | YES | | Nombre del archivo RUAT en `/uploads/drivers/`. `NULL` = sin RUAT o rechazado. Presente = en revisión o aprobado (ver `ruat_verified`) |
-| `ruat_verified` | BOOLEAN | NO | `false` | `true` = RUAT aprobado por el admin. Vehículo verificado |
-| `ruat_verified_at` | TIMESTAMPTZ | YES | | Fecha en que el admin aprobó el RUAT |
-| `ruat_required` | BOOLEAN | NO | `false` | `true` = el admin exige que el conductor envíe el RUAT urgentemente |
-| `ruat_required_reason` | ENUM | YES | | Motivo del requerimiento: `accident`, `vehicle_mismatch`, `suspension_reactivation`, `criminal_record` |
-| `ruat_required_at` | TIMESTAMPTZ | YES | | Fecha en que el admin activó el requerimiento |
-| `soat_rosette_number` | VARCHAR | YES | | Número de roseta del SOAT vigente |
-| `soat_start_date`, `soat_expiry_date` | DATE | YES | | Inicio y vencimiento de vigencia; el estado se calcula por vencimiento |
-| `soat_use` | VARCHAR | YES | | Uso declarado: `PUBLICO` o `PARTICULAR` |
-| `soat_verification_status`, `soat_verified_at` | VARCHAR/TIMESTAMPTZ | NO/YES | | Estado y fecha de revisión del SOAT |
-| `deleted_at` | TIMESTAMPTZ | YES | | Soft delete |
-| `created_at` | TIMESTAMPTZ | NO | | Fecha de creación |
-| `updated_at` | TIMESTAMPTZ | NO | | Fecha de última modificación |
-
-#### Estados derivados del RUAT (sin columnas extra)
-
-| `ruat_file` | `ruat_verified` | `ruat_required` | Estado visible |
+| Columna | Tipo | Nulo | Predeterminado |
 |---|---|---|---|
-| `NULL` | `false` | `false` | ○ Sin RUAT (opcional) |
-| `"foto.jpg"` | `false` | `false` | ⏳ En revisión por el admin |
-| `"foto.jpg"` | `true` | `false` | ✅ Vehículo Verificado |
-| `NULL` | `false` | `true` | ⚠️ RUAT requerido urgentemente |
+| id_calificacion | uuid | No | uuid_generate_v4() |
+| id_viaje | uuid | No |  |
+| calificacion | double precision | No |  |
+| tipo_calificador | tipo_calificador | No |  |
+| comentario | text | Sí |  |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | No | now() |
 
-#### Motivos de requerimiento (`ruat_required_reason`)
+Restricciones:
 
-| Valor | Cuándo se usa |
-|---|---|
-| `accident` | Se reportó un accidente con el vehículo dentro de la app |
-| `vehicle_mismatch` | Un pasajero reportó que el vehículo no coincide con el registrado |
-| `suspension_reactivation` | El conductor fue suspendido y necesita verificar el vehículo para reactivarse |
-| `criminal_record` | Se detectaron antecedentes que requieren verificación adicional del vehículo |
+- `CHECK (((calificacion >= (1.0)::double precision) AND (calificacion <= (5.0)::double precision)))`
+- `FOREIGN KEY (id_viaje) REFERENCES viaje(id_viaje) ON DELETE CASCADE`
+- `NOT NULL actualizado_en`
+- `NOT NULL calificacion`
+- `NOT NULL creado_en`
+- `NOT NULL id_calificacion`
+- `NOT NULL id_viaje`
+- `NOT NULL tipo_calificador`
+- `PRIMARY KEY (id_calificacion)`
 
----
+Índices:
 
-### `rides`
-Viaje desde solicitud hasta completado o cancelado. Es la tabla central del sistema.
-
-| Columna | Tipo | Nulo | Default | Descripción |
-|---|---|---|---|---|
-| `id` | UUID | NO | | Identificador único |
-| `passenger_id` | UUID | NO | | FK → users |
-| `driver_id` | UUID | YES | | FK → drivers (se asigna cuando acepta una oferta) |
-| `status` | ENUM | NO | | Ver estados abajo |
-| `pickup_location` | GEOMETRY | NO | | Punto de recogida (PostGIS) |
-| `pickup_address` | TEXT | NO | | Dirección de recogida en texto |
-| `dropoff_location` | GEOMETRY | NO | | Punto de destino (PostGIS) |
-| `dropoff_address` | TEXT | NO | | Dirección de destino en texto |
-| `vehicle_type_requested` | ENUM | YES | | Tipo de vehículo que solicita el pasajero |
-| `payment_method` | ENUM | NO | `cash` | Método de pago: `cash` o `qr` |
-| `base_fare` | DOUBLE | YES | | Tarifa base calculada |
-| `fare_per_km` | DOUBLE | YES | | Tarifa por kilómetro |
-| `fare_per_minute` | DOUBLE | YES | | Tarifa por minuto |
-| `total_fare` | DOUBLE | YES | | Tarifa total antes de descuentos |
-| `discount_amount` | DOUBLE | YES | | Descuento aplicado, si corresponde |
-| `final_fare` | DOUBLE | YES | | Tarifa final pagada |
-| `distance` | DOUBLE | YES | | Distancia en km |
-| `duration` | INTEGER | YES | | Duración en segundos |
-| `service_area_id` | UUID | YES | | FK → service_areas. Zona donde ocurrió el viaje. NULL = viaje histórico antes de implementar zonas |
-| `cancellation_reason_id` | UUID | YES | | FK → cancellation_reasons |
-| `cancellation_reason` | VARCHAR | YES | | Razón en texto (campo legacy, deprecado) |
-| `cancelled_by` | ENUM | YES | | `passenger` o `driver` |
-| `requested_at` | TIMESTAMPTZ | YES | | Cuándo el pasajero solicitó el viaje |
-| `accepted_at` | TIMESTAMPTZ | YES | | Cuándo el conductor aceptó |
-| `arrived_at` | TIMESTAMPTZ | YES | | Cuándo el conductor llegó al punto de recogida |
-| `passenger_ready_at` | TIMESTAMPTZ | YES | | Cuándo el pasajero confirmó que está listo |
-| `started_at` | TIMESTAMPTZ | YES | | Cuándo inició el viaje |
-| `completed_at` | TIMESTAMPTZ | YES | | Cuándo se completó |
-| `cancelled_at` | TIMESTAMPTZ | YES | | Cuándo se canceló |
-| `expires_at` | TIMESTAMPTZ | YES | | Cuándo expira la solicitud sin respuesta |
-
-| `deleted_at` | TIMESTAMPTZ | YES | | Soft delete |
-| `created_at` | TIMESTAMPTZ | NO | | Fecha de creación |
-| `updated_at` | TIMESTAMPTZ | NO | | Fecha de última modificación |
-
-**Estados posibles de `rides.status`:**
-```
-requested → offered → accepted → arrived → in_progress → completed
-                                                        ↘ cancelled
+```sql
+CREATE UNIQUE INDEX calificacion_pkey ON public.calificacion USING btree (id_calificacion);
+CREATE INDEX idx_calificacion_viaje ON public.calificacion USING btree (id_viaje);
+CREATE UNIQUE INDEX unico_calificacion_per_viaje ON public.calificacion USING btree (id_viaje, tipo_calificador);
 ```
 
-> ⚠️ Las columnas `base_fare`, `fare_per_km` y `fare_per_minute` se mantienen aunque exista `service_areas`. Son una fotografía de las tarifas vigentes en el momento del viaje — si las tarifas de la zona cambian después, los viajes históricos conservan los valores que se aplicaron realmente.
+### comision
 
----
+El periodo se identifica con inicio_periodo, siempre el primer día del mes. Se calculan fin_periodo (último día del mes) y fecha_limite (día 7 del mes siguiente, inclusive). El estado se calcula con la fecha de Bolivia: pagado si existe un pago confirmado; abierto antes del mes siguiente; pendiente_pago del día 1 al 7; atrasado desde el día 8. Un comprobante pendiente no equivale a un pago confirmado.
 
-### `ride_offers`
-Ofertas que los conductores hacen a un viaje solicitado. El pasajero elige cuál aceptar.
+Los totales se calculan mediante calcular_totales_comision desde los cobros vinculados por id_comision; una comisión sin cobros devuelve cero. No se añaden bloqueos de cierre.
 
-| Columna | Tipo | Nulo | Default | Descripción |
-|---|---|---|---|---|
-| `id` | UUID | NO | | Identificador único |
-| `ride_id` | UUID | NO | | FK → rides |
-| `driver_id` | UUID | NO | | FK → drivers |
-| `offered_price` | NUMERIC | NO | | Precio que ofrece el conductor |
-| `status` | ENUM | NO | | `pending`, `accepted`, `rejected`, `expired` |
-| `message` | TEXT | YES | | Mensaje opcional del conductor al pasajero |
-| `expires_at` | TIMESTAMPTZ | NO | | Cuándo expira la oferta |
-| `created_at` | TIMESTAMPTZ | NO | | Fecha de creación |
-| `updated_at` | TIMESTAMPTZ | NO | | Fecha de última modificación |
-
-> **Constraint:** Un conductor no puede tener dos ofertas activas al mismo viaje — `UNIQUE INDEX unique_active_offer ON ride_offers(driver_id, ride_id) WHERE status = 'active'`
-
----
-
-### `payments`
-Registro del pago de cada viaje.
-
-| Columna | Tipo | Nulo | Default | Descripción |
-|---|---|---|---|---|
-| `id` | UUID | NO | | Identificador único |
-| `ride_id` | UUID | NO | | FK → rides — UNIQUE (un pago por viaje) |
-| `passenger_id` | UUID | NO | | FK → users |
-| `amount` | DOUBLE | NO | | Monto pagado |
-| `currency` | VARCHAR | NO | | Moneda, ej: `BOB`, `USD` |
-| `payment_method` | ENUM | NO | | `cash`, `qr` |
-| `payment_status` | ENUM | NO | | `pending`, `completed`, `failed`, `refunded` |
-| `transaction_id` | VARCHAR | YES | | ID de transacción externa si aplica |
-| `paid_at` | TIMESTAMPTZ | YES | | Cuándo se confirmó el pago |
-| `created_at` | TIMESTAMPTZ | NO | | Fecha de creación |
-| `updated_at` | TIMESTAMPTZ | NO | | Fecha de última modificación |
-
----
-
-### `ratings`
-Calificaciones entre pasajero y conductor al finalizar un viaje. Ambos se califican mutuamente.
-
-| Columna | Tipo | Nulo | Default | Descripción |
-|---|---|---|---|---|
-| `id` | UUID | NO | | Identificador único |
-| `ride_id` | UUID | NO | | FK → rides |
-| `driver_id` | UUID | NO | | FK → drivers |
-| `passenger_id` | UUID | NO | | FK → users |
-| `rating` | DOUBLE | NO | | Calificación entre 1.0 y 5.0 |
-| `rater_type` | ENUM | NO | | `passenger` (califica al driver) o `driver` (califica al pasajero) |
-| `comment` | TEXT | YES | | Comentario opcional |
-| `created_at` | TIMESTAMPTZ | NO | | Fecha de creación |
-| `updated_at` | TIMESTAMPTZ | NO | | Fecha de última modificación |
-
-> **Constraints:**
-> - `CHECK (rating >= 1.0 AND rating <= 5.0)`
-> - `UNIQUE (ride_id, rater_type)` — evita doble calificación por viaje
-
----
-
-### `driver_earnings`
-Detalle de ganancias del conductor por cada viaje. Reemplaza el campo `total_earnings` que antes se acumulaba en `drivers`.
-
-| Columna | Tipo | Nulo | Default | Descripción |
-|---|---|---|---|---|
-| `id` | UUID | NO | | Identificador único |
-| `driver_id` | UUID | NO | | FK → drivers |
-| `ride_id` | UUID | NO | | FK → rides — UNIQUE (un registro por viaje) |
-| `settlement_id` | UUID | YES | NULL | FK → commission_settlements. NULL mientras el viaje no ha sido incluido en un cobro mensual |
-| `payment_method` | ENUM | NO | | `cash` o `qr` |
-| `gross_amount` | DOUBLE | NO | | Lo que pagó el pasajero |
-| `commission_rate` | DOUBLE | NO | | Tasa de comisión aplicada, ej: `0.20` = 20% |
-| `commission_amount` | DOUBLE | NO | | `gross_amount × commission_rate` |
-| `net_amount` | DOUBLE | NO | | `gross_amount - commission_amount` |
-| `commission_status` | ENUM | NO | pending | `pending` = comisión no cobrada aún. `collected` = cobrada en el settlement mensual |
-| `commission_paid_at` | TIMESTAMPTZ | YES | | Cuándo se marcó como cobrada (al pagar el settlement) |
-| `created_at` | TIMESTAMPTZ | NO | | Fecha de creación |
-
-**Relación entre `commission_status` y `settlement_id`:**
-
-| settlement_id | commission_status | Significado |
-|---|---|---|
-| NULL | `pending` | Viaje recién completado, no incluido en ningún cobro |
-| UUID | `pending` | Incluido en un settlement pero el conductor aún no pagó |
-| UUID | `collected` | El conductor pagó el settlement, comisión cobrada |
-
-**Flujo del dinero:**
-```
-Pasajero paga $10 al conductor (cash o QR)
-→ gross_amount      = 10.00
-→ commission_amount = 2.00  (el conductor le debe esto a la plataforma)
-→ net_amount        = 8.00  (lo que se queda el conductor)
-→ commission_status = 'pending'
-→ settlement_id     = NULL  (hasta fin de mes)
-```
-
----
-
-### `commission_settlements`
-Cobro mensual de comisiones agrupadas por conductor. En vez de cobrar viaje por viaje, al fin de cada mes se genera un resumen con el total acumulado.
-
-| Columna | Tipo | Nulo | Default | Descripción |
-|---|---|---|---|---|
-| `id` | UUID | NO | | Identificador único |
-| `driver_id` | UUID | NO | | FK → drivers |
-| `period_start` | DATE | NO | | Primer día del periodo, ej: `2024-01-01` |
-| `period_end` | DATE | NO | | Último día del periodo, ej: `2024-01-31` |
-| `total_rides` | INTEGER | NO | | Cantidad de viajes incluidos en este cobro |
-| `gross_amount` | DOUBLE | NO | | Suma de todos los `gross_amount` del periodo |
-| `total_commission` | DOUBLE | NO | | Suma de todas las comisiones del periodo |
-| `amount_paid` | DOUBLE | YES | NULL | Lo que pagó el conductor (puede ser parcial) |
-| `status` | ENUM | NO | `open` | Ver estados abajo |
-| `due_date` | DATE | NO | | Fecha límite de pago (generalmente 5 días después del cierre) |
-| `paid_at` | TIMESTAMPTZ | YES | | Cuándo pagó el conductor |
-| `payment_method` | ENUM | YES | | `cash`, `qr`, `transfer` |
-| `notes` | TEXT | YES | | Observaciones del admin |
-| `created_at` | TIMESTAMPTZ | NO | | Fecha de creación |
-| `updated_at` | TIMESTAMPTZ | NO | | Fecha de última modificación |
-
-**Estados posibles de `commission_settlements.status`:**
-
-| Estado | Significado |
-|---|---|
-| `open` | Mes en curso, los viajes se siguen acumulando |
-| `pending_payment` | Mes cerrado, esperando que el conductor pague |
-| `paid` | El conductor pagó |
-| `overdue` | Venció el `due_date` sin pago — se puede bloquear la cuenta |
-
-**Constraints:**
-- `UNIQUE (driver_id, period_start, period_end)` — un solo settlement por conductor por periodo
-- `CHECK (period_end > period_start)`
-- `CHECK (amount_paid >= 0)` cuando no es NULL
-- `CHECK` si `status = 'paid'` entonces `paid_at` no puede ser NULL
-
----
-
-## Tablas de soporte
-
-### `driver_locations`
-Ubicación en tiempo real del conductor. Se actualiza constantemente mientras está en línea.
-
-| Columna | Tipo | Nulo | Descripción |
+| Columna | Tipo | Nulo | Predeterminado |
 |---|---|---|---|
-| `driver_id` | UUID | NO | PK + FK → drivers |
-| `location` | GEOMETRY | NO | Punto geográfico PostGIS |
-| `heading` | DOUBLE | YES | Dirección en grados (0-360) |
-| `speed` | DOUBLE | YES | Velocidad en km/h |
-| `is_online` | BOOLEAN | NO | Si el conductor está activo en la app |
-| `updated_at` | TIMESTAMPTZ | NO | Última actualización de ubicación |
+| id_comision | uuid | No | uuid_generate_v4() |
+| id_conductor | uuid | No |  |
+| inicio_periodo | date | No |  |
+| notas | text | Sí |  |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | No | now() |
 
-> **Índice espacial:** `CREATE INDEX idx_driver_locations_geo ON driver_locations USING GIST(location)`
+Restricciones:
 
----
+- `CHECK ((inicio_periodo = (date_trunc('month'::text, (inicio_periodo)::timestamp with time zone))::date))`
+- `FOREIGN KEY (id_conductor) REFERENCES conductor(id_conductor)`
+- `NOT NULL actualizado_en`
+- `NOT NULL creado_en`
+- `NOT NULL id_comision`
+- `NOT NULL id_conductor`
+- `NOT NULL inicio_periodo`
+- `PRIMARY KEY (id_comision)`
+- `UNIQUE (id_conductor, inicio_periodo)`
 
-### `driver_requests`
-Solicitudes de registro como conductor. Incluye el historial de versiones si hay rechazos y reenvíos.
+Índices:
 
-| Columna | Tipo | Nulo | Descripción |
+```sql
+CREATE UNIQUE INDEX comision_pkey ON public.comision USING btree (id_comision);
+CREATE INDEX idx_settlements_conductor ON public.comision USING btree (id_conductor);
+CREATE UNIQUE INDEX unico_liquidacion_per_periodo ON public.comision USING btree (id_conductor, inicio_periodo);
+```
+
+
+### conductor
+
+| Columna | Tipo | Nulo | Predeterminado |
 |---|---|---|---|
-| `id` | UUID | NO | Identificador único |
-| `driver_id` | UUID | YES | FK → drivers (si ya fue creado) |
-| `user_id` | UUID | NO | FK → users |
-| `status` | ENUM | NO | `pending`, `observed`, `approved`, `rejected` |
-| `rejection_reason` | TEXT | YES | Motivo de observación o rechazo (nombre heredado de la columna) |
-| `rejected_documents` | JSON | YES | Documentos que deben corregirse al observar la solicitud (nombre heredado) |
-| `metadata` | JSON | YES | Datos OCR y auxiliares de la solicitud; el domicilio se guarda en `driver_domiciles` |
-| `version` | INTEGER | NO | Versión del intento (incrementa en cada reenvío) |
-| `created_at` | TIMESTAMPTZ | NO | Fecha de creación |
-| `updated_at` | TIMESTAMPTZ | NO | Fecha de última modificación |
+| id_conductor | uuid | No | uuid_generate_v4() |
+| id_usuario | uuid | No |  |
+| estado | conductor_estado | No | 'pendiente'::conductor_estado |
+| disponible | boolean | No | false |
+| motivo_rechazo | character varying(500) | Sí |  |
+| eliminado_en | timestamp with time zone | Sí |  |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | No | now() |
 
-`pending` = recibida para revisión; `observed` = requiere correcciones y puede reenviarse; `approved` = habilitada; `rejected` = decisión negativa. En una base existente, ejecutar `npm run migrate:driver-request-status` dentro de `backend` para agregar `observed` al ENUM; la migración maestra ya lo incluye para bases nuevas.
+Restricciones:
 
-### `driver_domiciles`
+- `FOREIGN KEY (id_usuario) REFERENCES usuario(id_usuario) ON DELETE CASCADE`
+- `NOT NULL actualizado_en`
+- `NOT NULL creado_en`
+- `NOT NULL disponible`
+- `NOT NULL estado`
+- `NOT NULL id_conductor`
+- `NOT NULL id_usuario`
+- `PRIMARY KEY (id_conductor)`
+- `UNIQUE (id_usuario)`
 
-Una fila por versión de solicitud. El domicilio declarado puede diferir del domicilio impreso en `user_identities.address` (CI). No se utiliza para la posición operativa del conductor.
+Índices:
 
-| Columna | Tipo | Descripción |
-|---|---|---|
-| `id` | UUID | Identificador |
-| `user_id` | UUID | Usuario solicitante |
-| `driver_request_id` | UUID UNIQUE | Solicitud/version a la que pertenece |
-| `address` | VARCHAR(255) | Dirección actual declarada |
-| `location` | GEOMETRY(POINT, 4326) | Punto marcado en el mapa |
-| `verification_status` | VARCHAR(20) | `pending`, `verified` o `rejected` |
-| `verified_by`, `verified_at` | UUID, TIMESTAMPTZ | Revisor y fecha |
-| `rejection_reason` | TEXT | Motivo de observación |
-| `created_at`, `updated_at` | TIMESTAMPTZ | Historial |
+```sql
+CREATE UNIQUE INDEX conductor_id_usuario_key ON public.conductor USING btree (id_usuario);
+CREATE UNIQUE INDEX conductor_pkey ON public.conductor USING btree (id_conductor);
+```
 
-El comprobante permanece en `documents` con tipo `domicileProof` y el mismo `driver_request_id`. En una base existente, ejecutar `npm run migrate:driver-domiciles`: crea la tabla, traslada los domicilios válidos de `metadata` y elimina allí la copia. Las entradas inválidas quedan intactas para revisión manual.
+### conductor_documento
 
----
-
-### `documents`
-
-Registro genérico de archivos vigentes. Evita crear una tabla por cada foto.
-Reemplaza a la antigua tabla `request_files`: los archivos de una solicitud se
-vinculan mediante `driver_request_id`.
-
-| Grupo de columnas | Descripción |
-|---|---|
-| `user_id`, `driver_id`, `vehicle_id` | Propietario del documento; solo `user_id` es obligatorio |
-| `driver_request_id` | Solicitud de conductor que presentó el archivo; conserva las versiones y el historial |
-| `document_type` | `ciFront`, `ciBack`, `licenseFront`, `licenseBack`, `ticPhoto`, `antecedentsPhoto`, `ruatPhoto`, `soatPhoto`, `domicileProof` o fotos del vehículo/perfil |
-| `file_path`, `original_filename`, `mime_type`, `file_size` | Archivo almacenado |
-| `ocr_data`, `issued_at`, `expires_at` | Lectura OCR y vigencias |
-| `is_current` | Permite conservar documentos vencidos como historial |
-| `verification_status`, `verified_at`, `verified_by`, `rejection_reason` | Revisión documental administrativa. Estado: `pending`, `verified` o `rejected` |
-
-El OCR y las comparaciones (CI/licencia, TIC/CI y licencia, CI/RUAT, RUAT/SOAT) validan el envío inicial, pero la solicitud queda `pending`. El administrador marca los documentos revisados y decide `approved`, `observed` o `rejected`. Solo al aprobar se crean el conductor y el vehículo. `observed` permite corregir y reenviar los documentos señalados; `rejected` es una decisión final. La TIC se guarda como documento, sin duplicar el nombre del conductor.
-
-En una base existente, ejecutar `npm run migrate:tic` dentro de `backend` para permitir `ticPhoto` en el `CHECK` de `documents.document_type`. La migración maestra ya lo incluye para bases nuevas.
-
-El domicilio requiere dirección escrita, ubicación marcada en el mapa y `domicileProof`. Los dos primeros se guardan en `driver_domiciles`; la foto se guarda en `documents`. El administrador comprueba el conjunto y puede observarlo para corrección. Para una base existente, ejecutar primero `npm run migrate:domicile` si aún no se ejecutó, y después `npm run migrate:driver-domiciles`. La migración maestra incluye ambos para bases nuevas.
-
----
-
-### `ride_waypoints`
-Paradas intermedias de un viaje (rutas con múltiples destinos). Cada viaje puede tener 0 o más paradas ordenadas por secuencia.
-
-| Columna | Tipo | Nulo | Default | Descripción |
-|---|---|---|---|---|
-| `id` | UUID | NO | | Identificador único |
-| `ride_id` | UUID | NO | | FK → rides (CASCADE) |
-| `sequence` | SMALLINT | NO | | Número de orden de la parada (1, 2, 3...) |
-| `location` | GEOMETRY(POINT, 4326) | NO | | Ubicación de la parada intermedia (WGS84) |
-| `address` | TEXT | NO | | Dirección legible de la parada |
-| `arrived_at` | TIMESTAMPTZ | YES | | Cuándo llegó el conductor a la parada |
-| `departed_at` | TIMESTAMPTZ | YES | | Cuándo salió el conductor de la parada |
-| `created_at` | TIMESTAMPTZ | NO | | Fecha de creación |
-
-**Constraints:**
-- `UNIQUE (ride_id, sequence)` — previene paradas duplicadas con el mismo número
-- `ON DELETE CASCADE` — al borrar un viaje se borran sus paradas
-
-**Índices:**
-- `idx_ride_waypoints_ride_id` — búsquedas por viaje
-- `idx_ride_waypoints_geo` (GIST) — queries espaciales de ubicación
-
-**Notas:**
-- El campo `pickup_location` en `rides` es el inicio; el `dropoff_location` es el destino final
-- Las paradas intermedias son complementarias al flujo principal pickup → dropoff
-- `arrived_at` y `departed_at` se registran en tiempo real durante el viaje
-
----
-
-### `emergency_contacts`
-Contactos del usuario que pueden recibir avisos por SMS durante una emergencia. Cada fila guarda `user_id`, `name`, `phone`, `relation`, `is_active` y fechas de creación y actualización.
-
-### `emergency_alerts`
-Cada activación SOS crea una alerta vinculada a `users` y, opcionalmente, a `rides`. Guarda estado (`active`, `resolved` o `false_alarm`), ubicación, dirección, hora de activación, resolución, responsable y notas.
-
-### `emergency_sms_logs`
-Registra un envío de SMS por contacto y alerta. Incluye número de destino, mensaje, estado (`pending`, `sent` o `failed`), identificador del proveedor y fechas o error del envío.
-
-### `emergency_recordings`
-Guarda referencias y metadatos de las grabaciones externas asociadas con una alerta. Una alerta puede tener varios segmentos de audio.
-
----
-
-### `notifications`
-Historial de notificaciones push enviadas a los usuarios.
-
-| Columna | Tipo | Nulo | Default | Descripción |
-|---|---|---|---|---|
-| `id` | UUID | NO | | Identificador único |
-| `user_id` | UUID | NO | | FK → users |
-| `title` | VARCHAR | NO | | Título de la notificación |
-| `body` | TEXT | NO | | Texto del mensaje |
-| `type` | ENUM | NO | | `ride_request`, `ride_accepted`, `ride_cancelled`, `payment`, `system`, `emergency`, `panic` |
-| `data` | JSONB | YES | | Payload extra, ej: `{"ride_id": "uuid"}` para abrir el viaje al tocar |
-| `is_read` | BOOLEAN | NO | false | Si el usuario ya la leyó |
-| `sent_at` | TIMESTAMPTZ | YES | | Cuándo se envió al dispositivo |
-| `read_at` | TIMESTAMPTZ | YES | | Cuándo el usuario la abrió |
-| `created_at` | TIMESTAMPTZ | NO | | Fecha de creación |
-
----
-
-### `audit_logs`
-Registro de cambios en tablas críticas para trazabilidad y auditoría.
-
-| Columna | Tipo | Nulo | Descripción |
+| Columna | Tipo | Nulo | Predeterminado |
 |---|---|---|---|
-| `id` | UUID | NO | Identificador único |
-| `table_name` | VARCHAR | NO | Tabla que fue modificada |
-| `record_id` | UUID | NO | ID del registro modificado |
-| `action` | ENUM | NO | `INSERT`, `UPDATE`, `DELETE` |
-| `old_values` | JSONB | YES | Valores anteriores al cambio |
-| `new_values` | JSONB | YES | Valores nuevos tras el cambio |
-| `changed_by` | UUID | YES | FK → users (quién hizo el cambio) |
-| `changed_at` | TIMESTAMPTZ | NO | Cuándo ocurrió el cambio |
+| id_documento | uuid | No |  |
+| id_conductor | uuid | No |  |
 
----
+Restricciones:
 
-## Tablas de configuración
+- `FOREIGN KEY (id_conductor) REFERENCES conductor(id_conductor)`
+- `FOREIGN KEY (id_documento) REFERENCES documento(id_documento)`
+- `NOT NULL id_conductor`
+- `NOT NULL id_documento`
+- `PRIMARY KEY (id_documento)`
 
-### `service_areas`
-Define las zonas geográficas donde opera la app. Cada zona tiene sus propias tarifas base y límites geográficos. Las solicitudes fuera de toda zona activa son rechazadas.
-
-| Columna | Tipo | Nulo | Default | Descripción |
-|---|---|---|---|---|
-| `id` | UUID | NO | | Identificador único |
-| `name` | VARCHAR(100) | NO | | Nombre descriptivo, ej: `La Paz`, `El Alto`, `Cochabamba` |
-| `boundary` | GEOMETRY(POLYGON) | NO | | Polígono PostGIS que define los límites geográficos del área |
-| `is_active` | BOOLEAN | NO | true | Si la app opera actualmente en esta zona |
-| `base_fare` | DOUBLE PRECISION | YES | | Tarifa base de esta zona. NULL = usar tarifa global |
-| `fare_per_km` | DOUBLE PRECISION | YES | | Precio por km en esta zona. NULL = usar tarifa global |
-| `fare_per_minute` | DOUBLE PRECISION | YES | | Precio por minuto en esta zona. NULL = usar tarifa global |
-| `currency` | VARCHAR(10) | NO | `BOB` | Moneda que se usa en esta zona |
-| `created_at` | TIMESTAMPTZ | NO | | Fecha de creación |
-| `updated_at` | TIMESTAMPTZ | NO | | Fecha de última modificación |
-
-**Constraints:**
-- `CHECK (base_fare > 0)` cuando no es NULL
-- `CHECK (fare_per_km > 0)` cuando no es NULL
-- `CHECK (fare_per_minute > 0)` cuando no es NULL
-
-**¿Por qué no usar ENUM para los nombres de zonas?**
-Un ENUM requiere una migración y despliegue cada vez que se agrega una ciudad. Con esta tabla basta con insertar un registro desde el panel de admin sin tocar el código ni reiniciar el servidor.
-
-**Flujo de uso:**
-```
-1. Pasajero solicita viaje
-2. Se consulta service_areas con ST_Contains(boundary, pickup_location)
-3. Si no hay zona activa → solicitud rechazada
-4. Si hay zona → se copian sus tarifas a rides.baseFare, farePerKm, farePerMinute
-5. rides.service_area_id → apunta a la zona donde ocurrió el viaje
-```
-
----
-
-### `cancellation_reasons`
-Catálogo de razones de cancelación. Reemplaza el campo de texto libre `cancellationReason` en `rides`.
-
-| Columna | Tipo | Nulo | Default | Descripción |
-|---|---|---|---|---|
-| `id` | UUID | NO | | Identificador único |
-| `code` | VARCHAR(50) | NO | | Clave interna, ej: `driver_no_show` |
-| `description` | TEXT | NO | | Texto que ve el usuario, ej: "El conductor no se presentó" |
-| `applicable_to` | ENUM | YES | | `passenger`, `driver`, `both` |
-| `is_active` | BOOLEAN | NO | true | Si aparece en la app |
-| `created_at` | TIMESTAMPTZ | YES | | Fecha de creación |
-
----
-
-### `pricing_rules`
-Reglas de precios dinámicos (surge pricing) por zona geográfica y franja horaria.
-
-| Columna | Tipo | Nulo | Default | Descripción |
-|---|---|---|---|---|
-| `id` | UUID | NO | | Identificador único |
-| `name` | VARCHAR(100) | NO | | Nombre descriptivo, ej: "Hora pico mañana centro" |
-| `zone` | GEOMETRY(POLYGON) | YES | | Polígono PostGIS que define el área de aplicación |
-| `multiplier` | DOUBLE | NO | 1.0 | Factor multiplicador, ej: `1.5` = 50% más caro |
-| `vehicle_type` | ENUM | YES | | Si aplica solo a un tipo de vehículo. NULL = todos |
-| `day_of_week` | INTEGER[] | YES | | Días que aplica, ej: `{1,2,3,4,5}`. NULL = todos los días |
-| `time_start` | TIME | YES | | Hora de inicio, ej: `07:00` |
-| `time_end` | TIME | YES | | Hora de fin, ej: `09:00` |
-| `is_active` | BOOLEAN | NO | true | Si la regla está activa |
-| `priority` | INTEGER | NO | 0 | Si dos reglas se solapan, gana la de mayor prioridad |
-| `created_at` | TIMESTAMPTZ | NO | | Fecha de creación |
-| `updated_at` | TIMESTAMPTZ | NO | | Fecha de última modificación |
-
----
-
-## Tablas del sistema
-
-| Tabla | Descripción |
-|---|---|
-| `SequelizeMeta` | No se usa; `migrate.js` ejecuta directamente la migración maestra una sola vez |
-| `spatial_ref_sys` | Sistema de referencia espacial de PostGIS (no modificar) |
-| `geometry_columns` | Metadatos de columnas geométricas de PostGIS (no modificar) |
-| `geography_columns` | Metadatos de columnas geográficas de PostGIS (no modificar) |
-
----
-
-## ENUMs
+Índices:
 
 ```sql
--- Roles de usuario
-user_role: 'passenger', 'driver', 'admin'
-
--- Estados del conductor
-driver_status: 'pending', 'approved', 'rejected', 'suspended'
-
--- Estados del viaje
-ride_status: 'requested', 'offered', 'accepted', 'arrived', 'in_progress', 'completed', 'cancelled', 'expired'
-
--- Quién canceló el viaje
-cancelled_by_type: 'passenger', 'driver', 'system'
-
--- Tipo de vehículo
-vehicle_type: 'taxi', 'minibus', 'motorcycle', 'bus'
-
--- Estados del vehículo
-vehicle_status: 'active', 'inactive', 'pending_review'
-
--- Estados de la oferta
-ride_offer_status: 'pending', 'accepted', 'rejected', 'expired'
-
--- Métodos de pago
-payment_method: 'cash', 'qr'
-
--- Estados del pago
-payment_status: 'pending', 'completed', 'failed', 'refunded'
-
--- Quién calificó
-rater_type: 'passenger', 'driver'
-
--- Estado de comisión del conductor
-commission_status: 'pending', 'collected'
-
--- A quién aplica la razón de cancelación
-applicable_to: 'passenger', 'driver', 'both'
-
--- Tipo de notificación
-notification_type: 'ride_request', 'ride_accepted', 'ride_cancelled', 'payment', 'system', 'emergency', 'panic'
-
--- Estado del cobro mensual
-settlement_status: 'open', 'pending_payment', 'paid', 'overdue'
-
--- Método de pago del settlement
-settlement_payment_method: 'cash', 'qr', 'transfer'
-
--- Acciones de auditoría
-audit_action: 'INSERT', 'UPDATE', 'DELETE'
-
--- document_type es VARCHAR con valores controlados por CHECK en documents
--- (ciFront, ciBack, licenseFront, licenseBack, ticPhoto, antecedentes, RUAT, SOAT y fotos del vehículo)
+CREATE INDEX conductor_documento_conductor ON public.conductor_documento USING btree (id_conductor);
+CREATE UNIQUE INDEX conductor_documento_pkey ON public.conductor_documento USING btree (id_documento);
 ```
 
----
+### contacto_emergencia
 
-## Índices
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_contacto_emergencia | uuid | No | uuid_generate_v4() |
+| id_usuario | uuid | No |  |
+| nombre | character varying(100) | No |  |
+| telefono | character varying(30) | No |  |
+| relacion | character varying(50) | Sí |  |
+| activo | boolean | No | true |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | No | now() |
+
+Restricciones:
+
+- `FOREIGN KEY (id_usuario) REFERENCES usuario(id_usuario) ON DELETE CASCADE`
+- `NOT NULL activo`
+- `NOT NULL actualizado_en`
+- `NOT NULL creado_en`
+- `NOT NULL id_contacto_emergencia`
+- `NOT NULL id_usuario`
+- `NOT NULL nombre`
+- `NOT NULL telefono`
+- `PRIMARY KEY (id_contacto_emergencia)`
+
+Índices:
 
 ```sql
--- Rendimiento en consultas de viajes
-CREATE INDEX idx_rides_passenger    ON rides(passenger_id);
-CREATE INDEX idx_rides_driver       ON rides(driver_id);
-CREATE INDEX idx_rides_status       ON rides(status);
-
--- Rendimiento en ofertas
-CREATE INDEX idx_ride_offers_ride_status ON ride_offers(ride_id, status);
-
--- Rendimiento en pagos
-CREATE INDEX idx_payments_ride      ON payments(ride_id);
-
--- Rendimiento en calificaciones
-CREATE INDEX idx_ratings_ride       ON ratings(ride_id);
-
--- Rendimiento en notificaciones
-CREATE INDEX idx_notifications_user ON notifications(user_id);
-
--- Rendimiento en ganancias
-CREATE INDEX idx_driver_earnings_driver     ON driver_earnings(driver_id);
-CREATE INDEX idx_driver_earnings_settlement ON driver_earnings(settlement_id);
-
--- Rendimiento en settlements
-CREATE INDEX idx_settlements_driver   ON commission_settlements(driver_id);
-CREATE INDEX idx_settlements_status   ON commission_settlements(status);
-CREATE INDEX idx_settlements_due_date ON commission_settlements(due_date);
-
--- Índice espacial para ubicaciones en tiempo real
-CREATE INDEX idx_driver_locations_geo ON driver_locations USING GIST(location);
-
--- Índices de zonas de servicio
-CREATE INDEX idx_service_areas_boundary ON service_areas USING GIST(boundary);
-CREATE INDEX idx_service_areas_active   ON service_areas(is_active);
-CREATE INDEX idx_rides_service_area     ON rides(service_area_id);
-
--- Índices para paradas intermedias de viajes
-CREATE INDEX idx_ride_waypoints_ride_id ON ride_waypoints(ride_id);
-CREATE INDEX idx_ride_waypoints_geo     ON ride_waypoints USING GIST(location);
-
+CREATE UNIQUE INDEX contacto_emergencia_pkey ON public.contacto_emergencia USING btree (id_contacto_emergencia);
+CREATE INDEX idx_contacto_emergencia_usuario ON public.contacto_emergencia USING btree (id_usuario);
+CREATE UNIQUE INDEX contacto_emergencia_telefono_activo_unico ON public.contacto_emergencia (id_usuario, (regexp_replace(telefono, '[^0-9]', '', 'g'))) WHERE activo;
 ```
 
----
+### documento
 
-## Constraints
+Las capturas con marco se recortan al recibirlas. `ruta_archivo` apunta a la imagen definitiva utilizada por OCR y revisión; las evidencias de CI se conservan cifradas en `evidencia_cifrada`. No se almacenan coordenadas de recorte.
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_documento | uuid | No | uuid_generate_v4() |
+| tipo_documento | character varying(40) | No |  |
+| ruta_archivo | character varying(500) | Sí |  |
+| tipo_mime | character varying(100) | Sí |  |
+| id_documento_principal | uuid | Sí |  |
+| evidencia_cifrada | text | Sí |  |
+| origen_evidencia | character varying(100) | Sí | captura_camara, archivo_subido, prueba_vida o semilla_desarrollo |
+| consentimiento_version | character varying(100) | Sí |  |
+| consentimiento_en | timestamp with time zone | Sí |  |
+| texto_ocr | text | Sí |  |
+| vigente | boolean | No | true |
+| estado_verificacion | character varying(20) | No | 'pendiente'::character varying |
+| verificado_en | timestamp with time zone | Sí |  |
+| id_usuario_verificador | uuid | Sí |  |
+| motivo_rechazo | text | Sí |  |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | No | now() |
+
+Restricciones:
+
+- `CHECK (((estado_verificacion)::text = ANY ((ARRAY['pendiente'::character varying, 'verificado'::character varying, 'rechazado'::character varying])::text[])))`
+- `CHECK (((tipo_documento)::text = ANY ((ARRAY['ciFront'::character varying, 'ciBack'::character varying, 'profilePhoto'::character varying, 'licenseFront'::character varying, 'licenseBack'::character varying, 'ticPhoto'::character varying, 'antecedentsPhoto'::character varying, 'ruatPhoto'::character varying, 'soatPhoto'::character varying, 'domicileProof'::character varying, 'carFront'::character varying, 'carBack'::character varying, 'carLeft'::character varying, 'carRight'::character varying, 'commissionProof'::character varying, 'psychologicalReport'::character varying, 'ci'::character varying])::text[])))`
+- `FOREIGN KEY (id_documento_principal) REFERENCES documento(id_documento)`
+- `FOREIGN KEY (id_usuario_verificador) REFERENCES usuario(id_usuario)`
+- `NOT NULL actualizado_en`
+- `NOT NULL creado_en`
+- `NOT NULL estado_verificacion`
+- `NOT NULL id_documento`
+- `NOT NULL tipo_documento`
+- `NOT NULL vigente`
+- `PRIMARY KEY (id_documento)`
+
+Índices:
 
 ```sql
--- Evitar que un conductor haga dos ofertas activas al mismo viaje
-CREATE UNIQUE INDEX unique_active_offer
-ON ride_offers(driver_id, ride_id)
-WHERE status = 'active';
-
--- Evitar que alguien califique dos veces el mismo viaje
-CREATE UNIQUE INDEX unique_rating_per_ride
-ON ratings(ride_id, rater_type);
-
--- Validar que la calificación esté entre 1 y 5
-ALTER TABLE ratings
-ADD CONSTRAINT check_rating_range
-CHECK (rating >= 1.0 AND rating <= 5.0);
-
--- Consistencia de cancelación: si hay cancelled_by debe haber cancelled_at y viceversa
-ALTER TABLE rides
-ADD CONSTRAINT check_cancelled_consistency
-CHECK (
-  (cancelled_by IS NULL AND cancelled_at IS NULL)
-  OR
-  (cancelled_by IS NOT NULL AND cancelled_at IS NOT NULL)
-);
-
--- Si hay razón de cancelación, debe haber cancelled_by
-ALTER TABLE rides
-ADD CONSTRAINT check_reason_requires_cancellation
-CHECK (
-  cancellation_reason_id IS NULL
-  OR cancelled_by IS NOT NULL
-);
-
--- Un solo settlement por conductor por periodo
-ALTER TABLE commission_settlements
-ADD CONSTRAINT unique_settlement_per_period
-UNIQUE (driver_id, period_start, period_end);
-
--- El periodo debe ser válido
-ALTER TABLE commission_settlements
-ADD CONSTRAINT check_period_order
-CHECK (period_end > period_start);
-
--- Si el monto pagado existe, debe ser positivo
-ALTER TABLE commission_settlements
-ADD CONSTRAINT check_amount_paid_positive
-CHECK (amount_paid IS NULL OR amount_paid >= 0);
-
--- Si está marcado como pagado, debe tener fecha de pago
-ALTER TABLE commission_settlements
-ADD CONSTRAINT check_paid_has_date
-CHECK (
-  status != 'paid' OR paid_at IS NOT NULL
-);
-
--- Paradas intermedias: una parada por secuencia por viaje
-ALTER TABLE ride_waypoints
-ADD CONSTRAINT uq_ride_waypoint UNIQUE (ride_id, sequence);
-
+CREATE UNIQUE INDEX documento_pkey ON public.documento USING btree (id_documento);
 ```
 
----
+### documento_antecedentes
 
-## Triggers
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_documento_antecedentes | uuid | No |  |
+| nombre_detectado | text | Sí |  |
+| ci_detectado | text | Sí |  |
+| fecha_emision_detectada | text | Sí |  |
+| nacimiento_detectado | text | Sí |  |
+| nacionalidad | text | Sí |  |
+| lugar_nacimiento | text | Sí |  |
+| expedido_en | text | Sí |  |
+| estado_civil | text | Sí |  |
+| ocupacion | text | Sí |  |
+| direccion_detectada | text | Sí |  |
+| motivo_tramite | text | Sí |  |
+| destinatario | text | Sí |  |
+| unidad_antecedentes | text | Sí |  |
+| resultado | text | Sí |  |
+| valido_hasta | text | Sí |  |
+| numero_certificado | text | Sí |  |
 
-### `validate_cancellation_reason`
-Valida que la razón de cancelación sea compatible con quién canceló el viaje. Ejemplo: un pasajero no puede usar una razón que solo aplica a conductores.
+Restricciones:
+
+- `FOREIGN KEY (id_documento_antecedentes) REFERENCES documento(id_documento)`
+- `NOT NULL id_documento_antecedentes`
+- `PRIMARY KEY (id_documento_antecedentes)`
+
+Índices:
 
 ```sql
-CREATE OR REPLACE FUNCTION check_cancellation_reason_match()
-RETURNS TRIGGER AS $$
-DECLARE
-  reason_applicable_to TEXT;
-BEGIN
-  IF NEW.cancellation_reason_id IS NOT NULL THEN
-    SELECT applicable_to INTO reason_applicable_to
-    FROM cancellation_reasons
-    WHERE id = NEW.cancellation_reason_id;
-
-    IF reason_applicable_to = 'driver' AND NEW.cancelled_by = 'passenger' THEN
-      RAISE EXCEPTION 'Esta razón de cancelación no aplica para pasajeros';
-    END IF;
-
-    IF reason_applicable_to = 'passenger' AND NEW.cancelled_by = 'driver' THEN
-      RAISE EXCEPTION 'Esta razón de cancelación no aplica para conductores';
-    END IF;
-  END IF;
-
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER validate_cancellation_reason
-BEFORE INSERT OR UPDATE ON rides
-FOR EACH ROW
-EXECUTE FUNCTION check_cancellation_reason_match();
+CREATE UNIQUE INDEX documento_antecedentes_pkey ON public.documento_antecedentes USING btree (id_documento_antecedentes);
 ```
 
----
+### documento_ci
 
-### `generate_monthly_settlement`
-Genera el cobro mensual de comisiones para un conductor. Se ejecuta al cerrar cada mes.
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_documento_ci | uuid | No |  |
+| nombres | character varying(150) | No |  |
+| apellido_paterno | character varying(100) | Sí |  |
+| apellido_materno | character varying(100) | Sí |  |
+| numero_ci | character varying(20) | No |  |
+| fecha_nacimiento | date | No |  |
+| fecha_emision | date | Sí |  |
+| fecha_vencimiento | date | Sí |  |
+| lugar_nacimiento | character varying(150) | Sí |  |
+| direccion | character varying(255) | Sí |  |
+| ocupacion | character varying(150) | Sí |  |
+| estado_civil | character varying(50) | Sí |  |
+| grupo_sanguineo | character varying(5) | Sí |  |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | No | now() |
+
+Restricciones:
+
+- `FOREIGN KEY (id_documento_ci) REFERENCES documento(id_documento)`
+- `NOT NULL actualizado_en`
+- `NOT NULL creado_en`
+- `NOT NULL fecha_nacimiento`
+- `NOT NULL id_documento_ci`
+- `NOT NULL nombres`
+- `NOT NULL numero_ci`
+- `PRIMARY KEY (id_documento_ci)`
+- `UNIQUE (numero_ci)`
+
+Índices:
 
 ```sql
-CREATE OR REPLACE FUNCTION generate_monthly_settlement(
-  p_driver_id UUID,
-  p_year INTEGER,
-  p_month INTEGER
-)
-RETURNS UUID AS $$
-DECLARE
-  v_period_start  DATE;
-  v_period_end    DATE;
-  v_settlement_id UUID;
-  v_total_rides   INTEGER;
-  v_gross_amount  DOUBLE PRECISION;
-  v_total_comm    DOUBLE PRECISION;
-BEGIN
-  v_period_start := make_date(p_year, p_month, 1);
-  v_period_end   := (v_period_start + INTERVAL '1 month - 1 day')::DATE;
-
-  -- Verificar que no exista ya un settlement para ese periodo
-  IF EXISTS (
-    SELECT 1 FROM commission_settlements
-    WHERE driver_id = p_driver_id
-    AND period_start = v_period_start
-    AND period_end = v_period_end
-  ) THEN
-    RAISE EXCEPTION 'Ya existe un settlement para este conductor en ese periodo';
-  END IF;
-
-  -- Calcular resumen del periodo
-  SELECT COUNT(*), SUM(gross_amount), SUM(commission_amount)
-  INTO v_total_rides, v_gross_amount, v_total_comm
-  FROM driver_earnings
-  WHERE driver_id = p_driver_id
-  AND created_at BETWEEN v_period_start AND v_period_end + INTERVAL '1 day'
-  AND commission_status = 'pending'
-  AND settlement_id IS NULL;
-
-  -- Si no hay viajes pendientes, no hacer nada
-  IF v_total_rides = 0 THEN
-    RETURN NULL;
-  END IF;
-
-  -- Crear el settlement
-  v_settlement_id := gen_random_uuid();
-  INSERT INTO commission_settlements (
-    id, driver_id, period_start, period_end,
-    total_rides, gross_amount, total_commission,
-    status, due_date, created_at, updated_at
-  ) VALUES (
-    v_settlement_id, p_driver_id, v_period_start, v_period_end,
-    v_total_rides, v_gross_amount, v_total_comm,
-    'pending_payment',
-    v_period_end + INTERVAL '5 days',
-    now(), now()
-  );
-
-  -- Vincular los viajes al settlement
-  UPDATE driver_earnings
-  SET settlement_id = v_settlement_id
-  WHERE driver_id = p_driver_id
-  AND created_at BETWEEN v_period_start AND v_period_end + INTERVAL '1 day'
-  AND commission_status = 'pending'
-  AND settlement_id IS NULL;
-
-  RETURN v_settlement_id;
-END;
-$$ LANGUAGE plpgsql;
+CREATE UNIQUE INDEX documento_ci_numero_ci_key ON public.documento_ci USING btree (numero_ci);
+CREATE UNIQUE INDEX documento_ci_pkey ON public.documento_ci USING btree (id_documento_ci);
 ```
 
----
+### documento_domicilio
 
-### `mark_settlement_paid`
-Registra el pago de un settlement y actualiza todos los viajes vinculados a `collected`.
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_documento_domicilio | uuid | No |  |
+| direccion_servicio | text | Sí |  |
+| mes_facturacion | text | Sí |  |
+| direccion | character varying(255) | Sí |  |
+| ubicacion | geometry(Point,4326) | Sí |  |
+
+Restricciones:
+
+- `FOREIGN KEY (id_documento_domicilio) REFERENCES documento(id_documento)`
+- `NOT NULL id_documento_domicilio`
+- `PRIMARY KEY (id_documento_domicilio)`
+
+Índices:
 
 ```sql
-CREATE OR REPLACE FUNCTION mark_settlement_paid(
-  p_settlement_id  UUID,
-  p_amount         DOUBLE PRECISION,
-  p_payment_method TEXT
-)
-RETURNS BOOLEAN AS $$
-BEGIN
-  -- Verificar que existe y está en estado cobrable
-  IF NOT EXISTS (
-    SELECT 1 FROM commission_settlements
-    WHERE id = p_settlement_id
-    AND status IN ('pending_payment', 'overdue')
-  ) THEN
-    RAISE EXCEPTION 'Settlement no encontrado o no está pendiente de pago';
-  END IF;
-
-  -- Marcar el settlement como pagado
-  UPDATE commission_settlements SET
-    status         = 'paid',
-    paid_at        = now(),
-    amount_paid    = p_amount,
-    payment_method = p_payment_method::settlement_payment_method,
-    updated_at     = now()
-  WHERE id = p_settlement_id;
-
-  -- Marcar todos los viajes vinculados como cobrados
-  UPDATE driver_earnings SET
-    commission_status  = 'collected',
-    commission_paid_at = now()
-  WHERE settlement_id = p_settlement_id;
-
-  RETURN TRUE;
-END;
-$$ LANGUAGE plpgsql;
+CREATE UNIQUE INDEX documento_domicilio_pkey ON public.documento_domicilio USING btree (id_documento_domicilio);
 ```
 
----
+### documento_informe_psicologico
 
-### `mark_overdue_settlements`
-Marca como vencidos todos los settlements que superaron su `due_date`. Debe ejecutarse diariamente con un cron job.
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_documento_informe_psicologico | uuid | No |  |
+| numero_informe | character varying(100) | Sí |  |
+| resultado | character varying(30) | No |  |
+| fecha_emision | date | No |  |
+| valida_hasta | date | Sí |  |
+
+Restricciones:
+
+- `CHECK (((valida_hasta IS NULL) OR (valida_hasta >= fecha_emision)))`
+- `CHECK (((resultado)::text = ANY ((ARRAY['apto'::character varying, 'no_apto'::character varying, 'requiere_reevaluacion'::character varying])::text[])))`
+- `FOREIGN KEY (id_documento_informe_psicologico) REFERENCES documento(id_documento)`
+- `NOT NULL fecha_emision`
+- `NOT NULL id_documento_informe_psicologico`
+- `NOT NULL resultado`
+- `PRIMARY KEY (id_documento_informe_psicologico)`
+
+Índices:
 
 ```sql
-CREATE OR REPLACE FUNCTION mark_overdue_settlements()
-RETURNS INTEGER AS $$
-DECLARE
-  v_count INTEGER;
-BEGIN
-  UPDATE commission_settlements
-  SET status     = 'overdue',
-      updated_at = now()
-  WHERE status   = 'pending_payment'
-  AND due_date   < CURRENT_DATE;
-
-  GET DIAGNOSTICS v_count = ROW_COUNT;
-  RETURN v_count;
-END;
-$$ LANGUAGE plpgsql;
+CREATE UNIQUE INDEX documento_informe_psicologico_pkey ON public.documento_informe_psicologico USING btree (id_documento_informe_psicologico);
 ```
 
----
+### documento_licencia
 
-### `get_service_area`
-Recibe un punto geográfico y retorna el área de servicio activa que lo contiene. Se usa al crear una solicitud de viaje para determinar la zona y sus tarifas.
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_documento_licencia | uuid | No |  |
+| nombre_detectado | text | Sí |  |
+| numero_licencia | text | Sí |  |
+| fecha_emision_detectada | text | Sí |  |
+| nacimiento_detectado | text | Sí |  |
+| nacionalidad | text | Sí |  |
+| fecha_vencimiento | text | Sí |  |
+| categoria | text | Sí |  |
+
+Restricciones:
+
+- `FOREIGN KEY (id_documento_licencia) REFERENCES documento(id_documento)`
+- `NOT NULL id_documento_licencia`
+- `PRIMARY KEY (id_documento_licencia)`
+
+Índices:
 
 ```sql
-CREATE OR REPLACE FUNCTION get_service_area(p_location GEOMETRY)
-RETURNS service_areas AS $$
-DECLARE
-  v_area service_areas;
-BEGIN
-  SELECT * INTO v_area
-  FROM service_areas
-  WHERE ST_Contains(boundary, p_location)
-  AND is_active = true
-  LIMIT 1;
-
-  RETURN v_area;
-END;
-$$ LANGUAGE plpgsql;
+CREATE UNIQUE INDEX documento_licencia_pkey ON public.documento_licencia USING btree (id_documento_licencia);
 ```
 
----
+### documento_ruat
 
-### `is_location_serviceable`
-Retorna `TRUE` si el punto está dentro de alguna zona activa, `FALSE` si está fuera. Se usa para rechazar solicitudes fuera de cobertura antes de crearlas.
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_documento_ruat | uuid | No |  |
+| placa | text | Sí |  |
+| marca | text | Sí |  |
+| modelo | text | Sí |  |
+| anio | text | Sí |  |
+| color | text | Sí |  |
+| capacidad | text | Sí |  |
+| tipo_vehiculo | text | Sí |  |
+| clase_vehiculo | text | Sí |  |
+| propietario_detectado | text | Sí |  |
+| ci_propietario_detectado | text | Sí |  |
+| municipio_registro | text | Sí |  |
+| numero_crpva | text | Sí |  |
+| fecha_emision | text | Sí |  |
+| inicio_propiedad | text | Sí |  |
+| cantidad_puertas | text | Sí |  |
+| tipo_servicio | text | Sí |  |
+| numero_chasis | text | Sí |  |
+| numero_motor | text | Sí |  |
+| combustible | text | Sí |  |
+| cilindrada | text | Sí |  |
+| tipo_motor | text | Sí |  |
+| observaciones_legales | text | Sí |  |
+
+Restricciones:
+
+- `FOREIGN KEY (id_documento_ruat) REFERENCES documento(id_documento)`
+- `NOT NULL id_documento_ruat`
+- `PRIMARY KEY (id_documento_ruat)`
+
+Índices:
 
 ```sql
-CREATE OR REPLACE FUNCTION is_location_serviceable(p_location GEOMETRY)
-RETURNS BOOLEAN AS $$
-BEGIN
-  RETURN EXISTS (
-    SELECT 1
-    FROM service_areas
-    WHERE ST_Contains(boundary, p_location)
-    AND is_active = true
-  );
-END;
-$$ LANGUAGE plpgsql;
+CREATE UNIQUE INDEX documento_ruat_pkey ON public.documento_ruat USING btree (id_documento_ruat);
 ```
 
----
+### documento_soat
 
-## Campos calculados
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_documento_soat | uuid | No |  |
+| numero_roseta | text | Sí |  |
+| anio | text | Sí |  |
+| departamento | text | Sí |  |
+| tipo_vehiculo | text | Sí |  |
+| placa_detectada | text | Sí |  |
+| fecha_inicio | text | Sí |  |
+| fecha_vencimiento | text | Sí |  |
+| uso | text | Sí |  |
 
-Estos campos **no se almacenan** en la BD. Se calculan con queries en tiempo de ejecución:
+Restricciones:
 
-### Ganancias totales del conductor
+- `FOREIGN KEY (id_documento_soat) REFERENCES documento(id_documento)`
+- `NOT NULL id_documento_soat`
+- `PRIMARY KEY (id_documento_soat)`
+
+Índices:
+
 ```sql
-SELECT SUM(net_amount)
-FROM driver_earnings
-WHERE driver_id = 'uuid-del-driver';
+CREATE UNIQUE INDEX documento_soat_pkey ON public.documento_soat USING btree (id_documento_soat);
 ```
 
-### Comisiones pendientes del conductor
+### documento_tic
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_documento_tic | uuid | No |  |
+| numero_licencia | text | Sí |  |
+| fecha_emision_detectada | text | Sí |  |
+| numero_tic | text | Sí |  |
+| lugar_emision | text | Sí |  |
+| nombres_detectados | text | Sí |  |
+| apellidos_detectados | text | Sí |  |
+| categoria | text | Sí |  |
+| fecha_vencimiento | text | Sí |  |
+
+Restricciones:
+
+- `FOREIGN KEY (id_documento_tic) REFERENCES documento(id_documento)`
+- `NOT NULL id_documento_tic`
+- `PRIMARY KEY (id_documento_tic)`
+
+Índices:
+
 ```sql
-SELECT SUM(commission_amount)
-FROM driver_earnings
-WHERE driver_id = 'uuid-del-driver'
-AND commission_status = 'pending';
+CREATE UNIQUE INDEX documento_tic_pkey ON public.documento_tic USING btree (id_documento_tic);
 ```
 
-### Total de viajes completados del conductor
+### evaluacion_psicologica
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_evaluacion_psicologica | uuid | No | uuid_generate_v4() |
+| id_solicitud_conductor | uuid | No |  |
+| id_usuario_evaluador | uuid | No |  |
+| programada_en | timestamp with time zone | No |  |
+| realizada_en | timestamp with time zone | Sí |  |
+| estado | character varying(20) | No |  |
+| id_documento_informe | uuid | Sí |  |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | No | now() |
+
+Restricciones:
+
+- `CHECK ((((estado)::text = 'realizada'::text) = ((realizada_en IS NOT NULL) AND (id_documento_informe IS NOT NULL))))`
+- `CHECK (((estado)::text = ANY ((ARRAY['programada'::character varying, 'realizada'::character varying, 'cancelada'::character varying])::text[])))`
+- `FOREIGN KEY (id_documento_informe) REFERENCES documento_informe_psicologico(id_documento_informe_psicologico)`
+- `FOREIGN KEY (id_solicitud_conductor) REFERENCES solicitud_conductor(id_solicitud_conductor)`
+- `FOREIGN KEY (id_usuario_evaluador) REFERENCES usuario(id_usuario)`
+- `NOT NULL actualizado_en`
+- `NOT NULL creado_en`
+- `NOT NULL estado`
+- `NOT NULL id_evaluacion_psicologica`
+- `NOT NULL id_solicitud_conductor`
+- `NOT NULL id_usuario_evaluador`
+- `NOT NULL programada_en`
+- `PRIMARY KEY (id_evaluacion_psicologica)`
+- `UNIQUE (id_documento_informe)`
+
+Índices:
+
 ```sql
-SELECT COUNT(*)
-FROM rides
-WHERE driver_id = 'uuid-del-driver'
-AND status = 'completed';
+CREATE UNIQUE INDEX evaluacion_psicologica_id_documento_informe_key ON public.evaluacion_psicologica USING btree (id_documento_informe);
+CREATE UNIQUE INDEX evaluacion_psicologica_pkey ON public.evaluacion_psicologica USING btree (id_evaluacion_psicologica);
 ```
 
-### Total de viajes del pasajero
+### cobros_conductor
+
+Los importes se calculan mediante calcular_ganancia_viaje: bruto desde viaje.tarifa_final; comisión redondeada a dos decimales con la tasa guardada; neto como bruto menos comisión, redondeado a dos decimales. El cierre mensual suma las comisiones ya redondeadas por viaje. Estos importes no son columnas físicas de cobros_conductor.
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_ganancia_conductor | uuid | No | uuid_generate_v4() |
+| id_viaje | uuid | No |  |
+| id_comision | uuid | Sí |  |
+| tasa_comision | double precision | No |  |
+| creado_en | timestamp with time zone | No | now() |
+
+Restricciones:
+
+- `FOREIGN KEY (id_comision) REFERENCES comision(id_comision)`
+- `FOREIGN KEY (id_viaje) REFERENCES viaje(id_viaje)`
+- `NOT NULL creado_en`
+- `NOT NULL id_ganancia_conductor`
+- `NOT NULL id_viaje`
+- `NOT NULL tasa_comision`
+- `PRIMARY KEY (id_ganancia_conductor)`
+- `UNIQUE (id_viaje)`
+
+Índices:
+
 ```sql
-SELECT COUNT(*)
-FROM rides
-WHERE passenger_id = 'uuid-del-usuario'
-AND status = 'completed';
+CREATE UNIQUE INDEX ganancia_conductor_id_viaje_key ON public.cobros_conductor USING btree (id_viaje);
+CREATE UNIQUE INDEX ganancia_conductor_pkey ON public.cobros_conductor USING btree (id_ganancia_conductor);
+CREATE INDEX idx_ganancia_conductor_comision ON public.cobros_conductor USING btree (id_comision);
 ```
 
-### Calificación promedio del conductor
+### motivo_cancelacion
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_motivo_cancelacion | uuid | No | uuid_generate_v4() |
+| codigo | character varying(50) | No |  |
+| descripcion | text | No |  |
+| aplicable_a | aplicable_a | Sí |  |
+| activo | boolean | No | true |
+| creado_en | timestamp with time zone | Sí | now() |
+
+Restricciones:
+
+- `NOT NULL activo`
+- `NOT NULL codigo`
+- `NOT NULL descripcion`
+- `NOT NULL id_motivo_cancelacion`
+- `PRIMARY KEY (id_motivo_cancelacion)`
+- `UNIQUE (codigo)`
+
+Índices:
+
 ```sql
-SELECT AVG(rating)
-FROM ratings
-WHERE driver_id = 'uuid-del-driver'
-AND rater_type = 'passenger';
+CREATE UNIQUE INDEX motivo_cancelacion_codigo_key ON public.motivo_cancelacion USING btree (codigo);
+CREATE UNIQUE INDEX motivo_cancelacion_pkey ON public.motivo_cancelacion USING btree (id_motivo_cancelacion);
 ```
 
-### Calificación promedio del pasajero
+### notificacion
+
+La lectura se determina únicamente por leido_en: NULL significa no leída y una fecha significa leída. El atributo is_read de la respuesta se calcula en memoria para conservar el contrato de la API.
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_notificacion | uuid | No | uuid_generate_v4() |
+| id_usuario | uuid | No |  |
+| titulo | character varying(255) | No |  |
+| cuerpo | text | No |  |
+| tipo | notificacion_tipo | No |  |
+| accion | character varying(100) | Sí |  |
+| id_viaje | uuid | Sí |  |
+| id_oferta_viaje | uuid | Sí |  |
+| id_solicitud_conductor | uuid | Sí |  |
+| id_alerta_emergencia | uuid | Sí |  |
+| id_comision | uuid | Sí |  |
+| enviado_en | timestamp with time zone | Sí |  |
+| leido_en | timestamp with time zone | Sí |  |
+| creado_en | timestamp with time zone | No | now() |
+
+Restricciones:
+
+- `CHECK ((num_nonnulls(id_viaje, id_oferta_viaje, id_solicitud_conductor, id_alerta_emergencia, id_comision) <= 1))`
+- `FOREIGN KEY (id_alerta_emergencia) REFERENCES alerta_emergencia(id_alerta_emergencia)`
+- `FOREIGN KEY (id_comision) REFERENCES comision(id_comision)`
+- `FOREIGN KEY (id_oferta_viaje) REFERENCES oferta_viaje(id_oferta_viaje)`
+- `FOREIGN KEY (id_solicitud_conductor) REFERENCES solicitud_conductor(id_solicitud_conductor)`
+- `FOREIGN KEY (id_usuario) REFERENCES usuario(id_usuario)`
+- `FOREIGN KEY (id_viaje) REFERENCES viaje(id_viaje)`
+- `NOT NULL creado_en`
+- `NOT NULL cuerpo`
+- `NOT NULL id_notificacion`
+- `NOT NULL id_usuario`
+- `NOT NULL tipo`
+- `NOT NULL titulo`
+- `PRIMARY KEY (id_notificacion)`
+
+Índices:
+
 ```sql
-SELECT AVG(rating)
-FROM ratings
-WHERE passenger_id = 'uuid-del-pasajero'
-AND rater_type = 'driver';
+CREATE INDEX idx_notificacion_usuario ON public.notificacion USING btree (id_usuario);
+CREATE UNIQUE INDEX notificacion_pkey ON public.notificacion USING btree (id_notificacion);
 ```
 
-### Ver deuda actual de un conductor
+### oferta_viaje
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_oferta_viaje | uuid | No | uuid_generate_v4() |
+| id_viaje | uuid | No |  |
+| id_conductor | uuid | No |  |
+| precio_ofertado | numeric(10,2) | No |  |
+| estado | viaje_oferta_estado | No | 'pendiente'::viaje_oferta_estado |
+| mensaje | text | Sí |  |
+| vence_en | timestamp with time zone | No |  |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | No | now() |
+
+Restricciones:
+
+- `FOREIGN KEY (id_conductor) REFERENCES conductor(id_conductor) ON DELETE CASCADE`
+- `FOREIGN KEY (id_viaje) REFERENCES viaje(id_viaje) ON DELETE CASCADE`
+- `NOT NULL actualizado_en`
+- `NOT NULL creado_en`
+- `NOT NULL estado`
+- `NOT NULL id_conductor`
+- `NOT NULL id_oferta_viaje`
+- `NOT NULL id_viaje`
+- `NOT NULL precio_ofertado`
+- `NOT NULL vence_en`
+- `PRIMARY KEY (id_oferta_viaje)`
+
+Índices:
+
 ```sql
-SELECT
-  period_start,
-  period_end,
-  total_rides,
-  total_commission,
-  status,
-  due_date
-FROM commission_settlements
-WHERE driver_id = 'uuid-del-driver'
-ORDER BY period_start DESC;
+CREATE INDEX idx_oferta_viaje_viaje_estado ON public.oferta_viaje USING btree (id_viaje, estado);
+CREATE UNIQUE INDEX oferta_viaje_pkey ON public.oferta_viaje USING btree (id_oferta_viaje);
 ```
 
-### Ver todos los conductores con deuda vencida
+### pago
+
+El método se consulta desde el viaje relacionado. Solo viaje.metodo_pago almacena este valor; el pago no permite registrar un método distinto.
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_pago | uuid | No | uuid_generate_v4() |
+| id_viaje | uuid | No |  |
+| importe | double precision | No |  |
+| moneda | character varying(10) | No | 'BOB'::character varying |
+| estado_pago | estado_pago | No | 'pendiente'::estado_pago |
+| transaccion_id | character varying(255) | Sí |  |
+| pagado_en | timestamp with time zone | Sí |  |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | No | now() |
+
+Restricciones:
+
+- `FOREIGN KEY (id_viaje) REFERENCES viaje(id_viaje) ON DELETE CASCADE`
+- `NOT NULL actualizado_en`
+- `NOT NULL creado_en`
+- `NOT NULL estado_pago`
+- `NOT NULL id_pago`
+- `NOT NULL id_viaje`
+- `NOT NULL importe`
+- `NOT NULL moneda`
+- `PRIMARY KEY (id_pago)`
+- `UNIQUE (id_viaje)`
+
+Índices:
+
 ```sql
-SELECT
-  d.id AS driver_id,
-  CONCAT_WS(' ', ui.first_names, ui.paternal_surname, ui.maternal_surname) AS name,
-  u.phone,
-  SUM(cs.total_commission) AS deuda_total
-FROM commission_settlements cs
-JOIN drivers d ON d.id = cs.driver_id
-JOIN users u ON u.id = d.user_id
-LEFT JOIN user_identities ui ON ui.user_id = u.id
-WHERE cs.status = 'overdue'
-GROUP BY d.id, ui.first_names, ui.paternal_surname, ui.maternal_surname, u.phone
-ORDER BY deuda_total DESC;
+CREATE UNIQUE INDEX pago_id_viaje_key ON public.pago USING btree (id_viaje);
+CREATE UNIQUE INDEX pago_pkey ON public.pago USING btree (id_pago);
 ```
 
-### Ver detalle de viajes de un settlement
+### pago_comision
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_pago_comision | uuid | No | uuid_generate_v4() |
+| id_comision | uuid | No |  |
+| id_documento_comprobante | uuid | Sí |  |
+| importe | numeric(12,2) | No |  |
+| metodo_pago | liquidacion_metodo_pago | No |  |
+| referencia | character varying(100) | Sí |  |
+| estado | character varying(20) | No |  |
+| presentado_en | timestamp with time zone | No | now() |
+| revisado_en | timestamp with time zone | Sí |  |
+| id_usuario_revisor | uuid | Sí |  |
+| motivo_rechazo | text | Sí |  |
+
+Restricciones:
+
+- `CHECK ((((estado)::text = 'pendiente'::text) OR ((revisado_en IS NOT NULL) AND (id_usuario_revisor IS NOT NULL))))`
+- `CHECK ((((estado)::text <> 'rechazado'::text) OR (length(TRIM(BOTH FROM motivo_rechazo)) > 0)))`
+- `CHECK (((estado)::text = ANY ((ARRAY['pendiente'::character varying, 'confirmado'::character varying, 'rechazado'::character varying])::text[])))`
+- `CHECK ((importe > (0)::numeric))`
+- `FOREIGN KEY (id_comision) REFERENCES comision(id_comision)`
+- `FOREIGN KEY (id_documento_comprobante) REFERENCES documento(id_documento)`
+- `FOREIGN KEY (id_usuario_revisor) REFERENCES usuario(id_usuario)`
+- `NOT NULL estado`
+- `NOT NULL id_comision`
+- `NOT NULL id_pago_comision`
+- `NOT NULL importe`
+- `NOT NULL metodo_pago`
+- `NOT NULL presentado_en`
+- `PRIMARY KEY (id_pago_comision)`
+
+Índices:
+
 ```sql
-SELECT
-  r.pickup_address,
-  r.dropoff_address,
-  de.gross_amount,
-  de.commission_amount,
-  de.net_amount,
-  de.payment_method,
-  r.completed_at
-FROM driver_earnings de
-JOIN rides r ON r.id = de.ride_id
-WHERE de.settlement_id = 'uuid-del-settlement'
-ORDER BY r.completed_at;
+CREATE UNIQUE INDEX pago_comision_pkey ON public.pago_comision USING btree (id_pago_comision);
+CREATE UNIQUE INDEX pago_comision_unico_confirmado ON public.pago_comision USING btree (id_comision) WHERE ((estado)::text = 'confirmado'::text);
+CREATE UNIQUE INDEX pago_comision_unico_pendiente ON public.pago_comision USING btree (id_comision) WHERE ((estado)::text = 'pendiente'::text);
 ```
 
-### Validar si un punto está dentro de una zona activa
+### parada_viaje
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_parada_viaje | uuid | No | uuid_generate_v4() |
+| id_viaje | uuid | No |  |
+| orden | smallint | No |  |
+| ubicacion | geometry(Point,4326) | No |  |
+| direccion | text | No |  |
+| llegada_en | timestamp with time zone | Sí |  |
+| salida_en | timestamp with time zone | Sí |  |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | Sí |  |
+
+Restricciones:
+
+- `FOREIGN KEY (id_viaje) REFERENCES viaje(id_viaje) ON DELETE CASCADE`
+- `NOT NULL creado_en`
+- `NOT NULL direccion`
+- `NOT NULL id_parada_viaje`
+- `NOT NULL id_viaje`
+- `NOT NULL orden`
+- `NOT NULL ubicacion`
+- `PRIMARY KEY (id_parada_viaje)`
+- `UNIQUE (id_viaje, orden)`
+
+Índices:
+
 ```sql
-SELECT id, name, base_fare, fare_per_km, fare_per_minute
-FROM service_areas
-WHERE ST_Contains(boundary, ST_GeomFromText('POINT(-68.1193 -16.5000)', 4326))
-AND is_active = true
-LIMIT 1;
+CREATE INDEX idx_parada_viaje_geografico ON public.parada_viaje USING gist (ubicacion);
+CREATE INDEX idx_parada_viaje_viaje_id ON public.parada_viaje USING btree (id_viaje);
+CREATE UNIQUE INDEX parada_viaje_pkey ON public.parada_viaje USING btree (id_parada_viaje);
+CREATE UNIQUE INDEX uq_viaje_waypoint ON public.parada_viaje USING btree (id_viaje, orden);
 ```
 
-### Ver en qué zona ocurrió cada viaje
+### registro_auditoria
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_registro_auditoria | uuid | No | uuid_generate_v4() |
+| nombre_tabla | character varying(100) | No |  |
+| id_registro_afectado | uuid | No |  |
+| accion | auditoria_accion | No |  |
+| motivo | text | Sí |  |
+| id_usuario_responsable | uuid | Sí |  |
+| realizado_en | timestamp with time zone | No | now() |
+
+Restricciones:
+
+- `FOREIGN KEY (id_usuario_responsable) REFERENCES usuario(id_usuario)`
+- `NOT NULL accion`
+- `NOT NULL id_registro_afectado`
+- `NOT NULL id_registro_auditoria`
+- `NOT NULL nombre_tabla`
+- `NOT NULL realizado_en`
+- `PRIMARY KEY (id_registro_auditoria)`
+
+Índices:
+
 ```sql
-SELECT
-  r.id,
-  r.pickup_address,
-  sa.name          AS zona,
-  r.base_fare,
-  r.fare_per_km,
-  r.final_fare
-FROM rides r
-LEFT JOIN service_areas sa ON sa.id = r.service_area_id
-ORDER BY r.created_at DESC;
+CREATE UNIQUE INDEX registro_auditoria_pkey ON public.registro_auditoria USING btree (id_registro_auditoria);
 ```
 
-### Detectar viajes fuera de zona (no deberían existir)
+### registro_auditoria_detalle
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_registro_auditoria | uuid | No |  |
+| nombre_campo | character varying(100) | No |  |
+| valor_anterior | text | Sí |  |
+| valor_nuevo | text | Sí |  |
+
+Restricciones:
+
+- `FOREIGN KEY (id_registro_auditoria) REFERENCES registro_auditoria(id_registro_auditoria)`
+- `NOT NULL id_registro_auditoria`
+- `NOT NULL nombre_campo`
+- `PRIMARY KEY (id_registro_auditoria, nombre_campo)`
+
+Índices:
+
 ```sql
-SELECT COUNT(*)
-FROM rides
-WHERE service_area_id IS NULL
-AND created_at > '2024-01-01';  -- solo viajes nuevos, no históricos
+CREATE UNIQUE INDEX registro_auditoria_detalle_pkey ON public.registro_auditoria_detalle USING btree (id_registro_auditoria, nombre_campo);
 ```
 
-### Comparar tarifa aplicada vs tarifa actual de la zona
+### registro_sms_emergencia
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_registro_sms_emergencia | uuid | No | uuid_generate_v4() |
+| id_alerta | uuid | No |  |
+| id_contacto | uuid | Sí |  |
+| telefono_destino | character varying(30) | No |  |
+| cuerpo_mensaje | text | No |  |
+| estado | sms_estado | No | 'pendiente'::sms_estado |
+| proveedor_id | character varying(255) | Sí |  |
+| enviado_en | timestamp with time zone | Sí |  |
+| fallo_en | timestamp with time zone | Sí |  |
+| mensaje_error | text | Sí |  |
+| creado_en | timestamp with time zone | No | now() |
+
+Restricciones:
+
+- `CHECK ((((estado = 'enviado'::sms_estado) AND (enviado_en IS NOT NULL)) OR ((estado = 'fallido'::sms_estado) AND (fallo_en IS NOT NULL)) OR (estado = 'pendiente'::sms_estado)))`
+- `FOREIGN KEY (id_alerta) REFERENCES alerta_emergencia(id_alerta_emergencia) ON DELETE CASCADE`
+- `FOREIGN KEY (id_contacto) REFERENCES contacto_emergencia(id_contacto_emergencia)`
+- `NOT NULL creado_en`
+- `NOT NULL cuerpo_mensaje`
+- `NOT NULL estado`
+- `NOT NULL id_alerta`
+- `NOT NULL id_registro_sms_emergencia`
+- `NOT NULL telefono_destino`
+- `PRIMARY KEY (id_registro_sms_emergencia)`
+
+Índices:
+
 ```sql
-SELECT
-  r.id,
-  r.created_at,
-  r.base_fare        AS tarifa_aplicada,
-  sa.base_fare        AS tarifa_actual,
-  r.base_fare - sa.base_fare AS diferencia
-FROM rides r
-JOIN service_areas sa ON sa.id = r.service_area_id
-WHERE r.status = 'completed'
-ORDER BY r.created_at DESC;
+CREATE INDEX idx_sms_logs_alerta ON public.registro_sms_emergencia USING btree (id_alerta);
+CREATE INDEX idx_sms_logs_estado ON public.registro_sms_emergencia USING btree (estado);
+CREATE UNIQUE INDEX registro_sms_emergencia_pkey ON public.registro_sms_emergencia USING btree (id_registro_sms_emergencia);
 ```
 
-### Ver todas las paradas de un viaje ordenadas
+### regla_tarifa
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_regla_tarifa | uuid | No | uuid_generate_v4() |
+| nombre | character varying(100) | No |  |
+| zona | geometry(Polygon,4326) | Sí |  |
+| multiplicador | double precision | No | 1.0 |
+| tipo_vehiculo | tipo_vehiculo | Sí |  |
+| dia_semana | smallint | Sí |  |
+| hora_inicio | time without time zone | Sí |  |
+| hora_fin | time without time zone | Sí |  |
+| activo | boolean | No | true |
+| prioridad | integer | No | 0 |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | No | now() |
+
+Restricciones:
+
+- `CHECK (((dia_semana >= 0) AND (dia_semana <= 6)))`
+- `NOT NULL activo`
+- `NOT NULL actualizado_en`
+- `NOT NULL creado_en`
+- `NOT NULL id_regla_tarifa`
+- `NOT NULL multiplicador`
+- `NOT NULL nombre`
+- `NOT NULL prioridad`
+- `PRIMARY KEY (id_regla_tarifa)`
+
+Índices:
+
 ```sql
-SELECT
-  rw.sequence,
-  rw.address,
-  ST_X(rw.location)::NUMERIC(10,6) AS longitude,
-  ST_Y(rw.location)::NUMERIC(10,6) AS latitude,
-  rw.arrived_at,
-  rw.departed_at,
-  EXTRACT(EPOCH FROM (rw.departed_at - rw.arrived_at)) / 60 AS duracion_minutos
-FROM ride_waypoints rw
-WHERE rw.ride_id = 'uuid-del-viaje'
-ORDER BY rw.sequence ASC;
+CREATE UNIQUE INDEX regla_tarifa_pkey ON public.regla_tarifa USING btree (id_regla_tarifa);
 ```
 
-### Verificar que todas las paradas fueron completadas
+### solicitud_conductor
+
+No se almacena rechazo_definitivo. El reenvío se determina desde el estado de la solicitud y los documentos rechazados vinculados. El backend valida que todos los documentos requeridos hayan sido revisados antes de resolver la solicitud.
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_solicitud_conductor | uuid | No | uuid_generate_v4() |
+| id_usuario | uuid | No |  |
+| estado | conductor_solicitud_estado | No | 'pendiente'::conductor_solicitud_estado |
+| motivo_rechazo | text | Sí |  |
+| estado_ocr | character varying(20) | No | 'pendiente'; admite complete y fallido |
+| ocr_procesado_en | timestamp with time zone | Sí |  |
+| version | integer | No | 1 |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | No | now() |
+
+Restricciones:
+
+- `FOREIGN KEY (id_usuario) REFERENCES usuario(id_usuario)`
+- `NOT NULL actualizado_en`
+- `NOT NULL creado_en`
+- `NOT NULL estado`
+- `NOT NULL estado_ocr`
+- `NOT NULL id_solicitud_conductor`
+- `NOT NULL id_usuario`
+- `NOT NULL version`
+- `PRIMARY KEY (id_solicitud_conductor)`
+
+Índices:
+
 ```sql
-SELECT
-  COUNT(*) AS total_paradas,
-  COUNT(CASE WHEN arrived_at IS NOT NULL THEN 1 END) AS completadas,
-  COUNT(CASE WHEN arrived_at IS NULL THEN 1 END) AS pendientes
-FROM ride_waypoints
-WHERE ride_id = 'uuid-del-viaje';
+CREATE UNIQUE INDEX solicitud_conductor_pkey ON public.solicitud_conductor USING btree (id_solicitud_conductor);
 ```
 
----
+### solicitud_documento
 
-## Flujos principales
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_solicitud_conductor | uuid | No |  |
+| id_documento | uuid | No |  |
 
-### 1. Solicitud y aceptación de viaje
-```
-1. Pasajero crea registro en rides (status = 'requested')
-2. Conductores cercanos ven la solicitud
-3. Cada conductor interesado crea un registro en ride_offers
-4. Pasajero ve las ofertas y acepta una
-5. rides.status → 'accepted', rides.driver_id se asigna
-6. Las otras ofertas pasan a status = 'rejected'
-```
+Restricciones:
 
-### 2. Ejecución del viaje
-```
-1. Conductor se dirige al pasajero → rides.status = 'arrived', rides.arrived_at = now
-2. Pasajero confirma que está listo → rides.passenger_ready_at = now
-3. Viaje inicia → rides.status = 'in_progress', rides.started_at = now
-4. Viaje termina → rides.status = 'completed', rides.completed_at = now
-```
+- `FOREIGN KEY (id_documento) REFERENCES documento(id_documento)`
+- `FOREIGN KEY (id_solicitud_conductor) REFERENCES solicitud_conductor(id_solicitud_conductor)`
+- `NOT NULL id_documento`
+- `NOT NULL id_solicitud_conductor`
+- `PRIMARY KEY (id_solicitud_conductor, id_documento)`
 
-### 3. Registro de pago y comisión
-```
-1. Al completar el viaje, pasajero paga al conductor (cash o QR)
-2. Se crea registro en payments (payment_status = 'completed')
-3. Se crea registro en driver_earnings:
-   - gross_amount = monto cobrado
-   - commission_amount = gross_amount × commission_rate
-   - net_amount = gross_amount - commission_amount
-   - commission_status = 'pending'
-4. Cuando el conductor paga la comisión a la plataforma:
-   - commission_status → 'collected'
-   - commission_paid_at = now
+Índices:
+
+```sql
+CREATE UNIQUE INDEX solicitud_documento_pkey ON public.solicitud_documento USING btree (id_solicitud_conductor, id_documento);
 ```
 
-### 4. Calificaciones
-```
-1. Al completar el viaje, ambas partes pueden calificar
-2. Pasajero crea ratings con rater_type = 'passenger' (califica al driver)
-3. Conductor crea ratings con rater_type = 'driver' (califica al pasajero)
-4. El constraint UNIQUE (ride_id, rater_type) impide doble calificación
-```
+### ubicacion_conductor
 
-### 5. Registro de conductor
-```
-1. Usuario crea driver_request (status = 'pending')
-2. Sube documentos → documents (vinculados con driver_request_id), incluyendo fotos frontal y trasera del vehículo
-3. Admin revisa → aprueba o rechaza con razón
-4. Si aprueba → se crea registro en drivers y vehicles
-5. Si rechaza → driver_request.version++ y puede reintentar
-```
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_conductor | uuid | No |  |
+| ubicacion | geometry(Point,4326) | No |  |
+| rumbo | double precision | Sí |  |
+| velocidad | double precision | Sí |  |
+| conectado | boolean | No | true |
+| ubicacion_registrada_en | timestamp with time zone | Sí |  |
+| actualizado_en | timestamp with time zone | No | now() |
 
-### 6. Cobro mensual de comisiones
-```
-Durante el mes:
-→ Cada viaje completado crea driver_earnings con:
-   commission_status = 'pending'
-   settlement_id = NULL
+Restricciones:
 
-Fin de mes (cron job o proceso manual):
-→ Se llama generate_monthly_settlement(driver_id, year, month)
-→ Se crea registro en commission_settlements (status = 'pending_payment')
-→ Todos los driver_earnings del periodo se vinculan al settlement
-→ Se notifica al conductor el monto total a pagar y el due_date
+- `FOREIGN KEY (id_conductor) REFERENCES conductor(id_conductor) ON DELETE CASCADE`
+- `NOT NULL actualizado_en`
+- `NOT NULL conectado`
+- `NOT NULL id_conductor`
+- `NOT NULL ubicacion`
+- `PRIMARY KEY (id_conductor)`
 
-Conductor paga antes del due_date:
-→ Se llama mark_settlement_paid(settlement_id, amount, method)
-→ commission_settlements.status → 'paid'
-→ Todos los driver_earnings vinculados → commission_status = 'collected'
+Índices:
 
-Si no paga antes del due_date:
-→ Cron job diario llama mark_overdue_settlements()
-→ commission_settlements.status → 'overdue'
-→ Se puede bloquear la cuenta del conductor (drivers.is_available = false)
+```sql
+CREATE INDEX idx_ubicacion_conductor_geografico ON public.ubicacion_conductor USING gist (ubicacion);
+CREATE INDEX ubicacion_conductor_geografia_idx ON public.ubicacion_conductor USING gist (((ubicacion)::geography));
+CREATE UNIQUE INDEX ubicacion_conductor_pkey ON public.ubicacion_conductor USING btree (id_conductor);
 ```
 
-### 7. Sistema de emergencias y pánico
-```
-Setup inicial:
-→ Usuario registra sus contactos en emergency_contacts
-→ Especifica nombre, teléfono y relación
+### usuario
 
-Durante un viaje o en cualquier momento:
-→ Usuario presiona botón de pánico (SOS)
-→ Se captura la ubicación y se crea un registro en emergency_alerts:
-   - user_id = usuario que activó
-   - ride_id = viaje actual (nullable si no está en viaje)
-   - location = POINT geoespacial
-   - status = active
-   - triggered_at = now()
-→ La referencia y metadatos de cada audio se guardan en emergency_recordings
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_usuario | uuid | No | uuid_generate_v4() |
+| firebase_uid | character varying(255) | No |  |
+| fcm_token | character varying(255) | Sí |  |
+| correo | character varying(255) | Sí |  |
+| telefono | character varying(30) | Sí |  |
+| contrasena | character varying(255) | Sí |  |
+| rol | usuario_rol | No | 'pasajero'::usuario_rol |
+| modo_actual | character varying(50) | Sí |  |
+| foto_perfil | character varying(500) | Sí |  |
+| activo | boolean | No | true |
+| telefono_verificado | boolean | No | false |
+| ultimo_acceso | timestamp with time zone | Sí |  |
+| eliminado_en | timestamp with time zone | Sí |  |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | No | now() |
 
-Notificaciones inmediatas:
-→ Cada SMS dirigido a un contacto se registra en emergency_sms_logs
-→ El estado de cada envío puede ser pending, sent o failed
+Restricciones:
 
-Resolución del evento:
-→ Se actualizan status y resolved_at en emergency_alerts
-```
+- `NOT NULL activo`
+- `NOT NULL actualizado_en`
+- `NOT NULL creado_en`
+- `NOT NULL firebase_uid`
+- `NOT NULL id_usuario`
+- `NOT NULL rol`
+- `NOT NULL telefono_verificado`
+- `PRIMARY KEY (id_usuario)`
+- `UNIQUE (correo)`
+- `UNIQUE (firebase_uid)`
+- `UNIQUE (telefono)`
 
-### 8. Viajes con múltiples paradas intermedias
-```
-Flujo de viaje con paradas:
-1. Pasajero solicita viaje con destinos múltiples
-2. Se crea ride con pickup_location y dropoff_location (destino final)
-3. Para cada parada intermedia se crea registro en ride_waypoints:
-   - sequence = 1, 2, 3, 4... (orden de ruta)
-   - location = POINT de cada parada
-   - address = dirección legible
-   - arrived_at = NULL (se completa al llegar)
-   - departed_at = NULL (se completa al partir)
+Índices:
 
-Durante la ejecución:
-4. Conductor navega a la primera parada (sequence=1)
-5. Al llegar → ride_waypoints[1].arrived_at = now()
-6. Al partir → ride_waypoints[1].departed_at = now()
-7. Repite para paradas 2, 3, etc.
-8. Finalmente va a dropoff_location
-
-Cálculo de tarifa:
-→ Se incluyen todas las distancias y tiempos en la ruta completa
-→ El pasajero ve el monto total antes de confirmar
-
-Consultas útiles:
-→ Ver todas las paradas de un viaje ordenadas por sequence
-→ Calcular tiempo entre paradas (departed_at[n] - arrived_at[n])
-→ Detectar paradas incompletas (arrived_at existe pero departed_at es NULL)
+```sql
+CREATE UNIQUE INDEX usuario_correo_key ON public.usuario USING btree (correo);
+CREATE UNIQUE INDEX usuario_firebase_uid_key ON public.usuario USING btree (firebase_uid);
+CREATE UNIQUE INDEX usuario_pkey ON public.usuario USING btree (id_usuario);
+CREATE UNIQUE INDEX usuario_telefono_key ON public.usuario USING btree (telefono);
 ```
 
----
+### usuario_documento
 
-*Documentación generada para uso interno del equipo de desarrollo.*
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_documento | uuid | No |  |
+| id_usuario | uuid | No |  |
+
+Restricciones:
+
+- `FOREIGN KEY (id_documento) REFERENCES documento(id_documento)`
+- `FOREIGN KEY (id_usuario) REFERENCES usuario(id_usuario)`
+- `NOT NULL id_documento`
+- `NOT NULL id_usuario`
+- `PRIMARY KEY (id_documento)`
+
+Índices:
+
+```sql
+CREATE UNIQUE INDEX usuario_documento_pkey ON public.usuario_documento USING btree (id_documento);
+CREATE INDEX usuario_documento_usuario ON public.usuario_documento USING btree (id_usuario);
+```
+
+### vehiculo
+
+Las características y datos del certificado se obtienen del RUAT aprobado vigente mediante vehiculo_documento. Esta tabla conserva únicamente identificación, conductor, estado operativo y fechas de control. No admite edición independiente de las características.
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_vehiculo | uuid | No | uuid_generate_v4() |
+| id_conductor | uuid | No |  |
+| estado | vehiculo_estado | No | 'activo'::vehiculo_estado |
+| eliminado_en | timestamp with time zone | Sí |  |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | No | now() |
+
+Restricciones:
+
+- `FOREIGN KEY (id_conductor) REFERENCES conductor(id_conductor) ON DELETE CASCADE`
+- `NOT NULL actualizado_en`
+- `NOT NULL creado_en`
+- `NOT NULL estado`
+- `NOT NULL id_conductor`
+- `NOT NULL id_vehiculo`
+- `PRIMARY KEY (id_vehiculo)`
+
+Índices:
+
+```sql
+CREATE UNIQUE INDEX vehiculo_pkey ON public.vehiculo USING btree (id_vehiculo);
+```
+
+La placa de un RUAT aprobado vigente no puede pertenecer a dos vehículos no eliminados. Esta regla se comprueba al vincular el documento, al aprobarlo y al cambiar sus datos.
+
+### vehiculo_documento
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_documento | uuid | No |  |
+| id_vehiculo | uuid | No |  |
+
+Restricciones:
+
+- `FOREIGN KEY (id_documento) REFERENCES documento(id_documento)`
+- `FOREIGN KEY (id_vehiculo) REFERENCES vehiculo(id_vehiculo)`
+- `NOT NULL id_documento`
+- `NOT NULL id_vehiculo`
+- `PRIMARY KEY (id_documento)`
+
+Índices:
+
+```sql
+CREATE UNIQUE INDEX vehiculo_documento_pkey ON public.vehiculo_documento USING btree (id_documento);
+CREATE INDEX vehiculo_documento_vehiculo ON public.vehiculo_documento USING btree (id_vehiculo);
+```
+
+### viaje
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_viaje | uuid | No | uuid_generate_v4() |
+| id_pasajero | uuid | No |  |
+| id_conductor | uuid | Sí |  |
+| estado | enum_viaje_estado | No | 'solicitado'::enum_viaje_estado |
+| ubicacion_recogida | geometry(Point,4326) | No |  |
+| direccion_recogida | text | No |  |
+| ubicacion_destino | geometry(Point,4326) | No |  |
+| direccion_destino | text | No |  |
+| tipo_vehiculo_solicitado | tipo_vehiculo | Sí |  |
+| metodo_pago | metodo_pago | No | 'efectivo'::metodo_pago |
+| tarifa_base | double precision | Sí |  |
+| tarifa_km | double precision | Sí |  |
+| tarifa_minuto | double precision | Sí |  |
+| tarifa_total | double precision | Sí |  |
+| tarifa_final | double precision | No |  |
+| distancia | double precision | Sí |  |
+| duracion | integer | Sí |  |
+| id_zona_servicio | uuid | Sí |  |
+| id_motivo_cancelacion | uuid | Sí |  |
+| cancelado_por | cancelado_por_tipo | Sí |  |
+| modo_solicitud | text | No | 'negociacion'::text |
+| clave_solicitud | text | Sí |  |
+| distancia_recogida | double precision | Sí |  |
+| duracion_recogida | integer | Sí |  |
+| aceptado_en | timestamp with time zone | Sí |  |
+| llegada_en | timestamp with time zone | Sí |  |
+| pasajero_listo_en | timestamp with time zone | Sí |  |
+| iniciado_en | timestamp with time zone | Sí |  |
+| ruta_recorrida | geometry(LineString,4326) | Sí |  |
+| completado_en | timestamp with time zone | Sí |  |
+| cancelado_en | timestamp with time zone | Sí |  |
+| vence_en | timestamp with time zone | Sí |  |
+| eliminado_en | timestamp with time zone | Sí |  |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | No | now() |
+
+Restricciones:
+
+- `CHECK ((((cancelado_por IS NULL) AND (cancelado_en IS NULL)) OR ((cancelado_por IS NOT NULL) AND (cancelado_en IS NOT NULL))))`
+- `CHECK (((id_motivo_cancelacion IS NULL) OR (cancelado_por IS NOT NULL)))`
+- `FOREIGN KEY (id_conductor) REFERENCES conductor(id_conductor)`
+- `FOREIGN KEY (id_motivo_cancelacion) REFERENCES motivo_cancelacion(id_motivo_cancelacion)`
+- `FOREIGN KEY (id_pasajero) REFERENCES usuario(id_usuario)`
+- `FOREIGN KEY (id_zona_servicio) REFERENCES zona_servicio(id_zona_servicio)`
+- `NOT NULL actualizado_en`
+- `NOT NULL creado_en`
+- `NOT NULL direccion_destino`
+- `NOT NULL direccion_recogida`
+- `NOT NULL estado`
+- `NOT NULL id_pasajero`
+- `NOT NULL id_viaje`
+- `NOT NULL metodo_pago`
+- `NOT NULL modo_solicitud`
+- `NOT NULL tarifa_final`
+- `NOT NULL ubicacion_destino`
+- `NOT NULL ubicacion_recogida`
+- `PRIMARY KEY (id_viaje)`
+
+Índices:
+
+```sql
+CREATE INDEX idx_viaje_conductor ON public.viaje USING btree (id_conductor);
+CREATE INDEX idx_viaje_estado ON public.viaje USING btree (estado);
+CREATE INDEX idx_viaje_pasajero ON public.viaje USING btree (id_pasajero);
+CREATE INDEX idx_viaje_service_area ON public.viaje USING btree (id_zona_servicio);
+CREATE UNIQUE INDEX viaje_clave_solicitud_unico ON public.viaje USING btree (id_pasajero, clave_solicitud) WHERE (clave_solicitud IS NOT NULL);
+CREATE UNIQUE INDEX viaje_conductor_ocupado_unico ON public.viaje USING btree (id_conductor) WHERE ((eliminado_en IS NULL) AND (id_conductor IS NOT NULL) AND ((estado = ANY (ARRAY['aceptado'::enum_viaje_estado, 'llegado'::enum_viaje_estado, 'en_curso'::enum_viaje_estado])) OR ((modo_solicitud = 'asignacion_rapida'::text) AND (estado = 'solicitado'::enum_viaje_estado))));
+CREATE UNIQUE INDEX viaje_pkey ON public.viaje USING btree (id_viaje);
+CREATE UNIQUE INDEX viaje_un_ocupado_pasajero ON public.viaje USING btree (id_pasajero) WHERE ((eliminado_en IS NULL) AND ((estado = ANY (ARRAY['aceptado'::enum_viaje_estado, 'llegado'::enum_viaje_estado, 'en_curso'::enum_viaje_estado])) OR ((modo_solicitud = 'asignacion_rapida'::text) AND (estado = 'solicitado'::enum_viaje_estado))));
+```
+
+### zona_servicio
+
+| Columna | Tipo | Nulo | Predeterminado |
+|---|---|---|---|
+| id_zona_servicio | uuid | No | uuid_generate_v4() |
+| nombre | character varying(100) | No |  |
+| limite | geometry(Polygon,4326) | No |  |
+| activo | boolean | No | true |
+| tarifa_base | double precision | Sí |  |
+| tarifa_km | double precision | Sí |  |
+| tarifa_minuto | double precision | Sí |  |
+| moneda | character varying(10) | No | 'BOB'::character varying |
+| tasa_comision | numeric(9,6) | No | 0.02 |
+| creado_en | timestamp with time zone | No | now() |
+| actualizado_en | timestamp with time zone | No | now() |
+
+La tasa se configura como fracción: 0.02 = 2 %. Se admite de 0 a 1, con hasta seis decimales. El valor predeterminado para zonas nuevas es 0.02. Al registrar una ganancia, la base obtiene esta tasa desde la zona del viaje y conserva la tasa aplicada; los cambios posteriores no modifican ganancias existentes. Un viaje sin zona debe asociarse a una zona válida antes de completarse.
+
+Restricciones:
+
+- `CHECK (tasa_comision BETWEEN 0 AND 1)`
+- `NOT NULL tasa_comision`
+- `CHECK ((tarifa_base > (0)::double precision))`
+- `CHECK ((tarifa_km > (0)::double precision))`
+- `CHECK ((tarifa_minuto > (0)::double precision))`
+- `NOT NULL activo`
+- `NOT NULL actualizado_en`
+- `NOT NULL creado_en`
+- `NOT NULL id_zona_servicio`
+- `NOT NULL limite`
+- `NOT NULL moneda`
+- `NOT NULL nombre`
+- `PRIMARY KEY (id_zona_servicio)`
+
+Índices:
+
+```sql
+CREATE INDEX idx_zona_servicio_activo ON public.zona_servicio USING btree (activo);
+CREATE INDEX idx_zona_servicio_limite ON public.zona_servicio USING gist (limite);
+CREATE UNIQUE INDEX zona_servicio_pkey ON public.zona_servicio USING btree (id_zona_servicio);
+```
+
+## Proyecciones del backend
+
+El esquema compatibilidad contiene vistas para conservar nombres de atributos y contratos de respuesta existentes. No contiene copias de datos ni pasos de transformación. Las proyecciones documentales son de lectura; las escrituras se realizan en las tablas físicas mediante los servicios de documentos, en la misma transacción que la operación.
+
+Los atributos virtuales metadata, rejectedDocuments, data, old_values y new_values se reconstruyen en JavaScript desde columnas y relaciones. No se persisten como JSON ni como objetos serializados en TEXT.
+
+La instalación incluye los datos de prueba ya existentes para desarrollo. No representa una aprobación real de conductor.

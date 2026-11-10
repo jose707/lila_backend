@@ -1,54 +1,59 @@
 // backend/src/models/index.js
-// Single entry point for all Sequelize models.
-// Import from this file anywhere in the app instead of individual model files.
+// Punto de entrada único para todos los modelos de Sequelize.
+// Importa los modelos desde este archivo en toda la aplicación.
 
-const sequelize           = require('../config/database');
-const setupAssociations   = require('./associations');
+const sequelize = require("../config/baseDatos");
+const configurarAsociaciones = require('./associations');
 
-const User                = require('./User');
-const UserIdentity        = require('./UserIdentity');
-const Driver              = require('./Driver');
-const Ride                = require('./Ride');
-const RideOffer           = require('./RideOffer');
-const Payment             = require('./Payment');
-const Rating              = require('./Rating');
-const Vehicle             = require('./Vehicle');
-const DriverLocation      = require('./DriverLocation');
-const DriverRequest       = require('./DriverRequest');
-const DriverDomicile      = require('./DriverDomicile');
-const RequestFile         = require('./RequestFile');
-const Notification        = require('./Notification');
-const CancellationReason  = require('./CancellationReason');
-const DriverEarning       = require('./DriverEarning');
-const CommissionSettlement = require('./CommissionSettlement');
-const ServiceArea         = require('./ServiceArea');
-const PricingRule         = require('./PricingRule');
-const AuditLog            = require('./AuditLog');
-const RideWaypoint        = require('./RideWaypoint');
+const Usuario = require("./Usuario");
+const UsuarioIdentidad = require("./UsuarioIdentidad");
+const Conductor = require("./Conductor");
+const Viaje = require("./Viaje");
+const ViajeOferta = require("./ViajeOferta");
+const Pago = require("./Pago");
+const Calificacion = require("./Calificacion");
+const Vehiculo = require("./Vehiculo");
+const ConductorUbicacion = require("./ConductorUbicacion");
+const ConductorSolicitud = require("./ConductorSolicitud");
+const ConductorDomicilio = require("./ConductorDomicilio");
+const SolicitudArchivo = require("./SolicitudArchivo");
+const Notificacion = require("./Notificacion");
+const CancelacionMotivo = require("./CancelacionMotivo");
+const CobrosConductor = require("./CobrosConductor");
+const ComisionLiquidacion = require("./ComisionLiquidacion");
+const ServicioZona = require("./ServiceZona");
+const TarifasRegla = require("./TarifaRegla");
+const AuditoriaRegistro = require("./AuditRegistro");
+const ViajeParada = require("./ViajeParada");
 
 // Wire all associations in one call
-setupAssociations();
+configurarAsociaciones();
 
 module.exports = {
   sequelize,
-  User,
-  UserIdentity,
-  Driver,
-  Ride,
-  RideOffer,
-  Payment,
-  Rating,
-  Vehicle,
-  DriverLocation,
-  DriverRequest,
-  DriverDomicile,
-  RequestFile,
-  Notification,
-  CancellationReason,
-  DriverEarning,
-  CommissionSettlement,
-  ServiceArea,
-  PricingRule,
-  AuditLog,
-  RideWaypoint,
+  Documento: require('./Documento'),
+  DocumentoCi: UsuarioIdentidad,
+  DocumentoDomicilio: ConductorDomicilio,
+  Comision: ComisionLiquidacion,
+  PagoComision: require('./PagoComision'),
+  Usuario: Usuario,
+  UsuarioIdentidad: UsuarioIdentidad,
+  Conductor: Conductor,
+  Viaje: Viaje,
+  ViajeOferta: ViajeOferta,
+  Pago: Pago,
+  Calificacion: Calificacion,
+  Vehiculo: Vehiculo,
+  ConductorUbicacion: ConductorUbicacion,
+  ConductorSolicitud: ConductorSolicitud,
+  ConductorDomicilio: ConductorDomicilio,
+  SolicitudArchivo: SolicitudArchivo,
+  Notificacion: Notificacion,
+  CancelacionMotivo: CancelacionMotivo,
+  CobrosConductor: CobrosConductor,
+  ComisionLiquidacion: ComisionLiquidacion,
+  ServicioZona: ServicioZona,
+  TarifaRegla: TarifasRegla,
+  AuditoriaRegistro: AuditoriaRegistro,
+  ViajeParada: ViajeParada
 };

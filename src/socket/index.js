@@ -1,51 +1,51 @@
-const { Server } = require('socket.io');
-const { socketAuthMiddleware } = require('./middleware/auth');
-const { registerRideHandlers } = require('./handlers/rideHandlers');
-const { registerLocationHandlers } = require('./handlers/locationHandlers');
+const { Server: Servidor } = require('socket.io');
+const { socketAutenticacionIntermediario: socketAutenticacionIntermediario } = require("./middleware/autenticacion");
+const { registrarViajeHandlers: registrarViajeHandlers } = require("./handlers/viajeHandlers");
+const { registrarUbicacionHandlers: registrarUbicacionHandlers } = require("./handlers/ubicacionHandlers");
 
 let io;
 
-const initializeSocket = (httpServer) => {
-  io = new Server(httpServer, {
+const inicializarSocket = (httpServidor) => {
+  io = new Servidor(httpServidor, {
     cors: {
       origin: '*',
       methods: ['GET', 'POST'],
-      credentials: true,
+      credentials: true
     },
     transports: ['websocket', 'polling'],
     pingTimeout: 60000,
-    pingInterval: 25000,
+    pingInterval: 25000
   });
 
-  io.use(socketAuthMiddleware);
+  io.use(socketAutenticacionIntermediario);
 
   io.on('connection', (socket) => {
-    const userId = socket.user?.id;
-    console.log(`🔌 [Socket] Connected: user=${userId} socket=${socket.id}`);
+    const usuarioId = socket.user?.id;
+    console.log(`🔌 [Socket] Connected: user=${usuarioId} socket=${socket.id}`);
 
     // Personal room for push events
-    socket.join(`user:${userId}`);
+    socket.join(`user:${usuarioId}`);
 
-    registerRideHandlers(io, socket);
-    registerLocationHandlers(io, socket);
+    registrarViajeHandlers(io, socket);
+    registrarUbicacionHandlers(io, socket);
 
-    socket.on('disconnect', async (reason) => {
-      console.log(`🔌 [Socket] Disconnected: user=${userId} reason=${reason}`);
+    socket.on('disconnect', async (motivo) => {
+      console.log(`🔌 [Socket] Disconnected: user=${usuarioId} reason=${motivo}`);
       try {
         // A second device/session may still be connected for this user.
-        const remaining = await io.in(`user:${userId}`).fetchSockets();
-        if (remaining.length === 0) {
-          const { Driver, DriverLocation } = require('../models');
-          const driver = await Driver.findOne({ where: { userId } });
-          if (driver) await DriverLocation.update({ is_online: false }, { where: { driver_id: driver.id } });
+        const restante = await io.in(`user:${usuarioId}`).fetchSockets();
+        if (restante.length === 0) {
+          const { Conductor: Conductor, ConductorUbicacion: ConductorUbicacion } = require('../models');
+          const conductor = await Conductor.findOne({ where: { userId: usuarioId } });
+          if (conductor) await ConductorUbicacion.update({ is_online: false }, { where: { driver_id: conductor.id } });
         }
       } catch (error) {
         console.warn('Driver disconnect availability:', error.message);
       }
     });
 
-    socket.on('error', (err) => {
-      console.error(`❌ [Socket] Error user=${userId}:`, err.message);
+    socket.on('error', (error) => {
+      console.error(`❌ [Socket] Error user=${usuarioId}:`, error.message);
     });
   });
 
@@ -53,16 +53,16 @@ const initializeSocket = (httpServer) => {
   return io;
 };
 
-const getIO = () => {
+const obtenerIo = () => {
   if (!io) {
     // During startup race, return a no-op proxy instead of throwing
     console.warn('⚠️ [Socket] getIO() called before initialization');
     return {
       to: () => ({ emit: () => {} }),
-      emit: () => {},
+      emit: () => {}
     };
   }
   return io;
 };
 
-module.exports = { initializeSocket, getIO };
+module.exports = { inicializarSocket: inicializarSocket, obtenerIo: obtenerIo };

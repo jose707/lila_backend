@@ -8,7 +8,7 @@
  */
 module.exports = {
   async up(queryInterface) {
-    await queryInterface.bulkInsert('cancellation_reasons', [
+    await queryInterface.bulkInsert("motivo_cancelacion", [
       // ── Para pasajeros ───────────────────────────────────────────────
       {
         id:            '11111111-0001-0001-0001-000000000001',
@@ -114,6 +114,6 @@ module.exports = {
   },
 
   async down(queryInterface) {
-    await queryInterface.bulkDelete('cancellation_reasons', null, {});
+    await queryInterface.bulkDelete("motivo_cancelacion", null, {});
   },
 };

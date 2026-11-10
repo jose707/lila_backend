@@ -1,45 +1,45 @@
 // backend/src/seeders/seeder.js
-const sequelize = require('../config/database');
-const User = require('../models/User');
-const Driver = require('../models/Driver');
-const DriverRequest = require('../models/DriverRequest');
-const RequestFile = require('../models/RequestFile');
-const Ride = require('../models/Ride');
-const setupAssociations = require('../models/associations');
+const sequelize = require("../config/baseDatos");
+const Usuario = require("../models/Usuario");
+const Conductor = require("../models/Conductor");
+const ConductorSolicitud = require("../models/ConductorSolicitud");
+const SolicitudArchivo = require("../models/SolicitudArchivo");
+const Viaje = require("../models/Viaje");
+const configurarAsociaciones = require('../models/associations');
 const bcrypt = require('bcryptjs');
 
-const seedDatabase = async () => {
+const semillaBaseDatos = async () => {
   try {
     // Configurar asociaciones
-    setupAssociations();
+    configurarAsociaciones();
 
     // Sincronizar base de datos - COMENTADO si ya existen las tablas
     // await sequelize.sync({ force: false });
     // console.log('✅ Base de datos sincronizada');
 
     // Crear usuario admin
-    const hashedPassword = await bcrypt.hash('admin123', 10);
+    const hashedContrasena = await bcrypt.hash('admin123', 10);
 
-    const adminUser = await User.create({
+    const administradorUsuario = await Usuario.create({
       name: 'Administrador LineaLila',
       email: 'admin@linealila.com',
       phone: '+573001234567',
-      password: hashedPassword,
-      role: 'admin',
+      password: hashedContrasena,
+      role: 'administrador',
       // Campos requeridos por el esquema normalizado
       firebaseUid: 'admin-seed-firebase-uid',
       isActive: true,
       phoneVerified: true,
-      currentMode: 'passenger',
-      profilePhoto: null,
+      modoActual: 'pasajero',
+      profilePhoto: null
     });
 
     console.log('\n✅ Admin creado exitosamente:');
-    console.log('   ID:', adminUser.id);
-    console.log('   Nombre:', adminUser.name);
-    console.log('   Email:', adminUser.email);
-    console.log('   Teléfono:', adminUser.phone);
-    console.log('   Rol:', adminUser.role);
+    console.log('   ID:', administradorUsuario.id);
+    console.log('   Nombre:', administradorUsuario.name);
+    console.log('   Email:', administradorUsuario.email);
+    console.log('   Teléfono:', administradorUsuario.phone);
+    console.log('   Rol:', administradorUsuario.role);
 
     console.log('\n✅ Base de datos configurada correctamente');
     console.log('\n📋 Credenciales de administrador:');
@@ -58,4 +58,4 @@ const seedDatabase = async () => {
   }
 };
 
-seedDatabase();
+semillaBaseDatos();
