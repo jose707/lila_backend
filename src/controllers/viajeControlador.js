@@ -49,6 +49,20 @@ const nombreParticipante = (identidad) =>
   [identidad?.firstNames, identidad?.paternalSurname, identidad?.maternalSurname]
     .map(parte => parte?.trim()).filter(Boolean).join(' ');
 
+const nombresDeUsuarios = async (ids) => {
+  const usuariosIds = [...new Set(ids.filter(Boolean))];
+  if (!usuariosIds.length) return new Map();
+  const identidades = await UsuarioIdentidad.findAll({
+    where: { userId: usuariosIds },
+    attributes: ['userId', 'firstNames', 'paternalSurname', 'maternalSurname', 'verificationStatus']
+  });
+  return new Map(identidades.map(identidad => [identidad.userId, {
+    name: nombreParticipante(identidad),
+    firstNames: identidad.firstNames?.trim() || null,
+    identidadVerificada: identidad.verificationStatus === 'verificado'
+  }]));
+};
+
 const identidadConNombre = {
   association: 'identity',
   attributes: ['firstNames', 'paternalSurname', 'maternalSurname'],
@@ -428,17 +442,26 @@ const obtenerViajePorId = async (solicitud, respuesta) => {
 
     // Calcular tiempo restante para cada contra-oferta (30 segundos de validez)
     const OFERTA_VALIDITY_SEGUNDOS = 30;
-    const enrichedViaje = viaje.toJSON();
+    const detalleHistorial = solicitud.query?.historial === '1';
+    const { rutaRecorrida, ...enrichedViaje } = viaje.toJSON();
+    if (detalleHistorial) {
+      const usuarioId = solicitud.user.id;
+      const conductorUsuarioId = enrichedViaje.driver?.userId ??
+        (viaje.driverId && viaje.passengerId !== usuarioId
+          ? (await Conductor.findByPk(viaje.driverId, { attributes: ['userId'] }))?.userId
+          : null);
+      if (!['completado', 'cancelado'].includes(viaje.status) ||
+        (viaje.passengerId !== usuarioId && conductorUsuarioId !== usuarioId)) {
+        return respuesta.status(404).json({ error: 'Viaje no encontrado en tu historial.' });
+      }
+    }
     const usuarioConductor = enrichedViaje.driver?.user || enrichedViaje.driver?.User;
-    const idsParticipantes = [enrichedViaje.passenger?.id, usuarioConductor?.id].filter(Boolean);
-    const identidades = idsParticipantes.length ? await UsuarioIdentidad.findAll({
-      where: { userId: idsParticipantes },
-      attributes: ['userId', 'firstNames', 'paternalSurname', 'maternalSurname']
-    }) : [];
-    const nombresParticipantes = new Map(identidades.map(identidad => [
-      identidad.userId,
-      nombreParticipante(identidad)
-    ]));
+    const nombresParticipantes = await nombresDeUsuarios([enrichedViaje.passenger?.id, usuarioConductor?.id]);
+    const conNombres = usuario => {
+      if (!usuario) return null;
+      const nombres = nombresParticipantes.get(usuario.id);
+      return { ...usuario, name: nombres?.name || usuario.name, firstNames: nombres?.firstNames ?? null };
+    };
 
     if (
     enrichedViaje.counterOffers &&
@@ -489,6 +512,7 @@ const obtenerViajePorId = async (solicitud, respuesta) => {
 
     const response = {
       ...enrichedViaje,
+      ...(detalleHistorial ? { rutaRecorrida: rutaRecorrida ?? null } : {}),
       // Ratings calculados desde tabla ratings (default 5.0 si no hay calificaciones)
       driverRatingValue: conductorPromedioCalificacion,
       passengerRatingValue: pasajeroPromedioCalificacion,
@@ -517,7 +541,7 @@ const obtenerViajePorId = async (solicitud, respuesta) => {
       driver: enrichedViaje.driver ?
       {
         ...enrichedViaje.driver,
-        User: usuarioConductor ? { ...usuarioConductor, name: nombresParticipantes.get(usuarioConductor.id) || usuarioConductor.name } : null,
+        User: conNombres(usuarioConductor),
         currentLocation: conductorUbicacionCoordenadas,
         rating: conductorPromedioCalificacion,
         vehicleModel: vehiculo ?
@@ -530,8 +554,8 @@ const obtenerViajePorId = async (solicitud, respuesta) => {
       // Pasajero con rating calculado
       passenger: enrichedViaje.passenger ?
       {
-        ...enrichedViaje.passenger,
-        name: nombresParticipantes.get(enrichedViaje.passenger.id) || enrichedViaje.passenger.name,
+        ...conNombres(enrichedViaje.passenger),
+        identidadVerificada: nombresParticipantes.get(enrichedViaje.passenger.id)?.identidadVerificada ?? false,
         rating: pasajeroPromedioCalificacion
       } :
       null
@@ -549,19 +573,42 @@ const obtenerViajePorId = async (solicitud, respuesta) => {
 const obtenerActivoViaje = async (solicitud, respuesta) => {
   try {
     const usuarioId = solicitud.user.id;
-    await require("../services/rapidaAsignacionServicio").vencerReservas();
-    const activoConductor = await Conductor.findOne({ where: { userId: usuarioId } });
+    const { role: rol, ultimoViajeId } = solicitud.query ?? {};
+    if (rol !== undefined && rol !== 'pasajero' && rol !== 'conductor') {
+      return respuesta.status(400).json({ error: 'El rol del viaje no es válido.' });
+    }
+    if (ultimoViajeId !== undefined && (!rol || typeof ultimoViajeId !== 'string' ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(ultimoViajeId))) {
+      return respuesta.status(400).json({ error: 'El identificador del último viaje no es válido.' });
+    }
+    if (!rol) await require('../services/rapidaAsignacionServicio').vencerReservas();
+    const conductor = rol === 'pasajero' ? null : await Conductor.findOne({ where: { userId: usuarioId } });
+    if (rol === 'conductor' && !conductor) return respuesta.json({ ride: null });
+    const participantes = [];
+    if (rol !== 'conductor') participantes.push({ passengerId: usuarioId });
+    if (conductor) participantes.push({ driverId: conductor.id });
+
+    if (ultimoViajeId) {
+      const cancelado = await Viaje.findOne({
+        where: { id: ultimoViajeId, status: 'cancelado', [Operador.or]: participantes }
+      });
+      if (cancelado) return respuesta.json({ ride: cancelado });
+    }
+
+    const estados = [{ status: { [Operador.in]: ['aceptado', 'llegado', 'en_curso'] } }];
+    if (!rol) {
+      estados.push({ requestMode: 'negociacion', status: { [Operador.in]: ['solicitado', 'ofertado'] },
+        expiresAt: { [Operador.gt]: new Date() } });
+    }
+    const consulta = {
+      where: { [Operador.or]: participantes, [Operador.and]: [{ [Operador.or]: estados }] },
+      order: [['createdAt', 'DESC']]
+    };
 
     let activoViaje;
     try {
       activoViaje = await Viaje.findOne({
-        where: {
-          [Operador.or]: [{ passengerId: usuarioId }, ...(activoConductor ? [{ driverId: activoConductor.id }] : [])],
-          [Operador.and]: [{ [Operador.or]: [
-            { status: { [Operador.in]: ['aceptado', 'llegado', 'en_curso'] } },
-            { requestMode: 'negociacion', status: { [Operador.in]: ['solicitado', 'ofertado'] }, expiresAt: { [Operador.gt]: new Date() } }]
-          }]
-        },
+        ...consulta,
         include: [
         {
           model: Usuario,
@@ -588,18 +635,11 @@ const obtenerActivoViaje = async (solicitud, respuesta) => {
         asociacionError.message
       );
       // Retornar viaje sin Driver si hay error
-      activoViaje = await Viaje.findOne({
-        where: {
-          [Operador.or]: [{ passengerId: usuarioId }, ...(activoConductor ? [{ driverId: activoConductor.id }] : [])],
-          [Operador.and]: [{ [Operador.or]: [
-            { status: { [Operador.in]: ['aceptado', 'llegado', 'en_curso'] } },
-            { requestMode: 'negociacion', status: { [Operador.in]: ['solicitado', 'ofertado'] }, expiresAt: { [Operador.gt]: new Date() } }]
-          }]
-        }
-      });
+      activoViaje = await Viaje.findOne(consulta);
     }
 
     if (!activoViaje) {
+      if (rol) return respuesta.json({ ride: null });
       return respuesta.status(404).json({
         error: 'No hay viajes activos'
       });
@@ -630,6 +670,7 @@ const obtenerViajeHistorial = async (solicitud, respuesta) => {
     if (conductorId) oClausula.push({ driverId: conductorId });
 
     const viajes = await Viaje.findAll({
+      attributes: { exclude: ['rutaRecorrida'] },
       where: {
         [Operador.or]: oClausula,
         status: {
@@ -666,8 +707,17 @@ const obtenerViajeHistorial = async (solicitud, respuesta) => {
       }
     });
 
+    const nombres = await nombresDeUsuarios(viajes.flatMap(viaje => [viaje.passenger?.id, viaje.driver?.user?.id]));
+    const conNombre = usuario => usuario && { ...usuario, name: nombres.get(usuario.id)?.name || usuario.name };
     respuesta.status(200).json({
-      rides: viajes,
+      rides: viajes.map(viaje => {
+        const datos = viaje.toJSON();
+        return {
+          ...datos,
+          passenger: conNombre(datos.passenger),
+          driver: datos.driver ? { ...datos.driver, user: conNombre(datos.driver.user) } : null
+        };
+      }),
       total,
       limit: parseInt(limite),
       offset: parseInt(desplazamiento)

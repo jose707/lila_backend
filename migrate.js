@@ -22,6 +22,7 @@ const APP_TABLES = new Set([
   "pago",
   "calificacion",
   "notificacion",
+  "envio_notificacion",
   "comision",
   "cobros_conductor",
   "regla_tarifa",

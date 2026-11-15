@@ -4,7 +4,7 @@ const Viaje = require("../models/Viaje");
 const ViajeParada = require("../models/ViajeParada");
 const Conductor = require("../models/Conductor");
 const ConductorUbicacion = require('../models/ConductorUbicacion');
-const { conduccionRutaPolilinea: conduccionRutaPolilinea } = require("../services/asignacionRouting");
+const { conduccionRutaDetalle } = require("../services/asignacionRouting");
 
 const coordenadas = (geometria) => {
   const [longitud, latitud] = geometria?.coordinates ?? [];
@@ -26,11 +26,14 @@ async function obtenerViajeRuta(solicitud, respuesta) {
     if (!esPasajero && !conductor)
     return respuesta.status(403).json({ error: 'Este viaje no te pertenece.' });
 
-    const recalcular = solicitud.query?.recalcular === '1';
+    const viajeEnCurso = viaje.status === 'en_curso';
+    const haciaRecogida = solicitud.query?.recogida === '1';
+    if (haciaRecogida && (viaje.status !== 'aceptado' || !viaje.driverId))
+      return respuesta.status(409).json({ error: 'El conductor no está en camino a la recogida.' });
+    if (solicitud.query?.recalcular === '1' && !viajeEnCurso)
+      return respuesta.status(409).json({ error: 'El viaje no está en curso.' });
     let origen = coordenadas(viaje.pickupLocation);
-    if (recalcular) {
-      if (viaje.status !== 'en_curso')
-        return respuesta.status(409).json({ error: 'El viaje no está en curso.' });
+    if (viajeEnCurso || haciaRecogida) {
       const ubicacion = await ConductorUbicacion.findByPk(viaje.driverId);
       origen = coordenadas(ubicacion?.location);
       const registrada = new Date(ubicacion?.location_recorded_at).getTime();
@@ -38,9 +41,9 @@ async function obtenerViajeRuta(solicitud, respuesta) {
         return respuesta.status(409).json({ error: 'No hay una ubicación reciente del conductor.' });
     }
     const paradas = [...(viaje.waypoints ?? [])]
-      .filter((parada) => !recalcular || !parada.arrived_at && !parada.departed_at)
+      .filter((parada) => !viajeEnCurso || !parada.arrived_at && !parada.departed_at)
       .sort((primero, segundo) => primero.sequence - segundo.sequence);
-    const puntos = [
+    const puntos = haciaRecogida ? [origen, coordenadas(viaje.pickupLocation)] : [
     origen,
     ...paradas.map((parada) => coordenadas(parada.location)),
     coordenadas(viaje.dropoffLocation)];
@@ -48,8 +51,7 @@ async function obtenerViajeRuta(solicitud, respuesta) {
     if (puntos.some((punto) => !punto))
     return respuesta.status(422).json({ error: 'El recorrido contiene ubicaciones inválidas.' });
 
-    const polilinea = await conduccionRutaPolilinea(puntos);
-    return respuesta.json({ polyline: polilinea });
+    return respuesta.json(await conduccionRutaDetalle(puntos));
   } catch (error) {
     return respuesta.status(error.status || 500).json({
       error: error.message || 'No se pudo trazar el recorrido.',

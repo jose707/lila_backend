@@ -2,6 +2,8 @@
 'use strict';
 const { DataTypes: DatosTipos } = require('sequelize');
 const sequelize = require("../config/baseDatos");
+const tiposViaje = ['solicitud_viaje', 'viaje_aceptado', 'viaje_cancelado'];
+const tiposEmergencia = ['emergencia', 'panico'];
 
 const Notificacion = sequelize.define(
   'Notification',
@@ -26,13 +28,10 @@ const Notificacion = sequelize.define(
     },
     type: {
       type: DatosTipos.ENUM(
-        'solicitud_viaje',
-        'viaje_aceptado',
-        'viaje_cancelado',
+        ...tiposViaje,
         'pago',
         'sistema',
-        'emergencia',
-        'panico'
+        ...tiposEmergencia
       ),
       allowNull: false
     },
@@ -62,10 +61,6 @@ const Notificacion = sequelize.define(
       type: new DatosTipos.VIRTUAL(DatosTipos.BOOLEAN, ['read_at']),
       get() { return this.getDataValue('read_at') != null; }
     },
-    sent_at: {
-      type: DatosTipos.DATE,
-      allowNull: true
-    },
     read_at: {
       type: DatosTipos.DATE,
       allowNull: true
@@ -80,4 +75,6 @@ const Notificacion = sequelize.define(
   }
 );
 
+Notificacion.tiposViaje = tiposViaje;
+Notificacion.tiposEmergencia = tiposEmergencia;
 module.exports = Notificacion;

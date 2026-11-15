@@ -1,5 +1,6 @@
 const { Server: Servidor } = require('socket.io');
 const { socketAutenticacionIntermediario: socketAutenticacionIntermediario } = require("./middleware/autenticacion");
+const { cuentaDesactivada } = require('../middleware/autenticacion');
 const { registrarViajeHandlers: registrarViajeHandlers } = require("./handlers/viajeHandlers");
 const { registrarUbicacionHandlers: registrarUbicacionHandlers } = require("./handlers/ubicacionHandlers");
 
@@ -65,4 +66,11 @@ const obtenerIo = () => {
   return io;
 };
 
-module.exports = { inicializarSocket: inicializarSocket, obtenerIo: obtenerIo };
+function desconectarCuentaDesactivada(usuarioId) {
+  if (!io) return;
+  const sala = io.in(`user:${usuarioId}`);
+  sala.emit('cuenta:desactivada', cuentaDesactivada);
+  sala.disconnectSockets(true);
+}
+
+module.exports = { inicializarSocket, obtenerIo, desconectarCuentaDesactivada };

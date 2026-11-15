@@ -362,9 +362,6 @@ baseDatosTest('el perfil de conductor se crea únicamente al aprobar una solicit
   comprobar.ok(tipos.every(tipo => documentosGuardados.some(archivo => archivo.fileType === tipo && archivo.status === 'verificado')));
   comprobar.equal((await segunda.reload()).status, 'pendiente');
   comprobar.equal(await Conductor.count({ where: { userId: pasajero } }), 0);
-  // Simular una instalación anterior y aplicar la migración sin perder registros.
-  await db.query('ALTER TABLE public.evaluacion_psicologica ALTER COLUMN programada_en SET NOT NULL', { esquemaFisico: true });
-  await require('../../../migrations/20261109-informes-sin-programacion').up(db);
   const enviarInforme = async (resultado, pdf = '%PDF-1.4\n%%EOF') => {
     const form = new FormData();
     form.set('resultado', resultado);
@@ -508,22 +505,35 @@ baseDatosTest('calificaciones normalizadas obtienen participantes y promedios de
   comprobar.equal(existente.datos.rating.driverId, conductor.id);
 });
 
-baseDatosTest('registra alertas para la central y envía un SMS por contacto sin duplicar avisos', async (t) => {
+baseDatosTest('registra alertas y respeta la configuración de avisos por WhatsApp', async (t) => {
   const { registrarEmergenciaViaje, listarEmergencias } = require('../../controllers/emergenciaViajeControlador');
   const { agregarContacto } = require('../../controllers/contactosEmergenciaControlador');
-  const { Conductor } = require('../../models');
+  const { Conductor, UsuarioIdentidad } = require('../../models');
+  await UsuarioIdentidad.create({ userId: pasajero, firstNames: 'Ana', paternalSurname: 'Paz',
+    ciNumber: '12345678', birthDate: '1995-01-01' });
   const viaje = await servicio.reservar(pasajero, entrada());
   const conductor = await Conductor.findByPk(viaje.driverId);
-  const configuracion = { TWILIO_ACCOUNT_SID: 'AC' + '1'.repeat(32), TWILIO_AUTH_TOKEN: 'prueba', TWILIO_SMS_FROM: '+15550100001' };
+  const configuracion = { EMERGENCY_WHATSAPP_ENABLED: 'true', WHATSAPP_PHONE_NUMBER_ID: '123456789', WHATSAPP_ACCESS_TOKEN: 'prueba',
+    WHATSAPP_API_VERSION: 'v25.0', WHATSAPP_TEMPLATE_LANGUAGE: 'es' };
   for (const [clave, valor] of Object.entries(configuracion)) {
     const anterior = process.env[clave];
     process.env[clave] = valor;
     t.after(() => { if (anterior === undefined) delete process.env[clave]; else process.env[clave] = anterior; });
   }
-  const envios = t.mock.method(globalThis, 'fetch', async (_url, opciones) => {
-    comprobar.equal(opciones.body.get('To'), '+15550100002');
-    comprobar.match(opciones.body.get('Body'), /maps\.google\.com/);
-    return { ok: true, json: async () => ({ sid: 'SM' + '2'.repeat(32), status: 'queued' }) };
+  const envios = t.mock.method(globalThis, 'fetch', async (url, opciones) => {
+    comprobar.equal(url, 'https://graph.facebook.com/v25.0/123456789/messages');
+    comprobar.equal(opciones.headers.Authorization, 'Bearer prueba');
+    const datos = JSON.parse(opciones.body);
+    comprobar.equal(datos.to, '15550100002');
+    comprobar.equal(datos.messaging_product, 'whatsapp');
+    comprobar.equal(datos.type, 'template');
+    comprobar.equal(datos.template.name, 'alerta_emergencia_viaje');
+    comprobar.equal(datos.template.language.code, 'es');
+    comprobar.deepEqual(datos.template.components, [{ type: 'body', parameters: [
+      { type: 'text', parameter_name: 'nombre_contacto', text: 'Ana Paz' },
+      { type: 'text', parameter_name: 'ubicacion', text: 'https://maps.google.com/?q=-16.5,-68.15' }
+    ] }]);
+    return { ok: true, json: async () => ({ messages: [{ id: 'wamid.prueba', message_status: 'accepted' }] }) };
   });
   const respuestaContacto = { status(codigo) { this.codigo = codigo; return this; }, json(datos) { this.datos = datos; } };
   await agregarContacto({ user: { id: pasajero }, body: { nombre: 'Ana', telefono: '+15550100002' } }, respuestaContacto);
@@ -553,23 +563,127 @@ baseDatosTest('registra alertas para la central y envía un SMS por contacto sin
   comprobar.equal(alertas.find(alerta => alerta.id_usuario === conductor.userId).longitud, null);
   const central = { json(datos) { this.datos = datos; } };
   await listarEmergencias({}, central);
-  comprobar.ok(central.datos.alertas.some(alerta => alerta.idAlerta === primera.datos.idAlerta));
+  const avisoCentral = central.datos.alertas.find(alerta => alerta.idAlerta === primera.datos.idAlerta);
+  comprobar.equal(avisoCentral.avisosEnviados, 1);
+  const contactoConductor = { status(codigo) { this.codigo = codigo; return this; }, json(datos) { this.datos = datos; } };
+  await agregarContacto({ user: { id: conductor.userId }, body: { nombre: 'Ana', telefono: '+15550100003' } }, contactoConductor);
+  comprobar.equal(contactoConductor.codigo, 201);
+  // Nueva alerta para comprobar el caso sin GPS y un rechazo de Meta, sin envíos reales.
+  await db.query("UPDATE public.alerta_emergencia SET estado='resuelto', resuelta_en=NOW() WHERE id_viaje=:id", {
+    esquemaFisico: true, replacements: { id: viaje.id }
+  });
+  envios.mock.mockImplementation(async (_url, opciones) => {
+    const datos = JSON.parse(opciones.body);
+    comprobar.equal(datos.to, '15550100003');
+    comprobar.deepEqual(datos.template.components[0].parameters.map(p => p.text), ['Tu contacto', 'Ubicación no disponible']);
+    return { ok: false, status: 400, json: async () => ({ error: { code: 132001, message: 'Detalle privado' } }) };
+  });
+  const fallida = await registrar(conductor.userId);
+  comprobar.equal(fallida.codigo, 201);
+  comprobar.deepEqual(fallida.datos.contactos, { total: 1, aceptados: 0, fallidos: 1 });
+  const [[registro]] = await db.query(`SELECT estado, proveedor_id, mensaje_error FROM public.registro_sms_emergencia
+    WHERE id_alerta=:id`, { esquemaFisico: true, replacements: { id: fallida.datos.idAlerta } });
+  comprobar.equal(registro.estado, 'fallido');
+  comprobar.equal(registro.proveedor_id, null);
+  comprobar.match(registro.mensaje_error, /132001/);
+  comprobar.doesNotMatch(registro.mensaje_error, /Detalle privado/);
+  delete process.env.WHATSAPP_ACCESS_TOKEN;
+  await db.query("UPDATE public.alerta_emergencia SET estado='resuelto', resuelta_en=NOW() WHERE id_viaje=:id", {
+    esquemaFisico: true, replacements: { id: viaje.id }
+  });
+  const sinConfigurar = await registrar(conductor.userId);
+  comprobar.deepEqual(sinConfigurar.datos.contactos, { total: 1, aceptados: 0, fallidos: 1 });
+  comprobar.equal(envios.mock.callCount(), 2);
+
+  delete process.env.EMERGENCY_WHATSAPP_ENABLED;
+  process.env.WHATSAPP_ACCESS_TOKEN = configuracion.WHATSAPP_ACCESS_TOKEN;
+  await db.query("UPDATE public.alerta_emergencia SET estado='resuelto', resuelta_en=NOW() WHERE id_viaje=:id", {
+    esquemaFisico: true, replacements: { id: viaje.id }
+  });
+  const avisosDesactivados = await registrar(pasajero, ubicacion);
+  comprobar.equal(avisosDesactivados.codigo, 201);
+  comprobar.equal(avisosDesactivados.datos.registradaEnCentral, true);
+  comprobar.deepEqual(avisosDesactivados.datos.contactos, { total: 0, aceptados: 0, fallidos: 0 });
+  comprobar.equal(envios.mock.callCount(), 2);
 });
 
-baseDatosTest('el detalle del viaje devuelve los nombres de ambos participantes', async () => {
+baseDatosTest('el detalle y el historial del viaje devuelven los nombres de ambos participantes', async () => {
   const { Conductor, UsuarioIdentidad } = require('../../models');
-  const { obtenerViajePorId } = require('../../controllers/viajeControlador');
+  const { obtenerViajePorId, obtenerHistorialViajes } = require('../../controllers/viajeControlador');
   const conductor = await Conductor.findByPk(cercanoConductor);
   await UsuarioIdentidad.bulkCreate([
-    { userId: pasajero, firstNames: 'Ana', paternalSurname: 'Paz', ciNumber: '12345678', birthDate: '1995-01-01' },
-    { userId: conductor.userId, firstNames: 'Luis', paternalSurname: 'Vargas', maternalSurname: 'Rojas', ciNumber: '87654321', birthDate: '1990-01-01' }
+    { userId: pasajero, firstNames: 'Ana María', paternalSurname: 'Paz', ciNumber: '12345678', birthDate: '1995-01-01' },
+    { userId: conductor.userId, firstNames: 'Luis Alberto', paternalSurname: 'Vargas', maternalSurname: 'Rojas', ciNumber: '87654321', birthDate: '1990-01-01' }
   ]);
   const viaje = await servicio.reservar(pasajero, entrada());
   const respuesta = { status(codigo) { this.codigo = codigo; return this; }, json(datos) { this.datos = datos; } };
   await obtenerViajePorId({ params: { id: viaje.id }, user: { id: pasajero } }, respuesta);
   comprobar.equal(respuesta.codigo, 200);
-  comprobar.equal(respuesta.datos.passenger.name, 'Ana Paz');
-  comprobar.equal(respuesta.datos.driver.User.name, 'Luis Vargas Rojas');
+  comprobar.equal(respuesta.datos.passenger.name, 'Ana María Paz');
+  comprobar.equal(respuesta.datos.passenger.firstNames, 'Ana María');
+  comprobar.equal(respuesta.datos.passenger.identidadVerificada, false);
+  comprobar.equal(respuesta.datos.driver.User.name, 'Luis Alberto Vargas Rojas');
+  comprobar.equal(respuesta.datos.driver.User.firstNames, 'Luis Alberto');
+  comprobar.equal(respuesta.datos.driver.status, 'aprobado');
+  await UsuarioIdentidad.update({ verificationStatus: 'verificado' }, { where: { userId: pasajero } });
+  await obtenerViajePorId({ params: { id: viaje.id }, user: { id: conductor.userId } }, respuesta);
+  comprobar.equal(respuesta.codigo, 200);
+  comprobar.equal(respuesta.datos.passenger.identidadVerificada, true);
+  await viaje.update({ status: 'cancelado', cancelledBy: 'pasajero', cancelledAt: new Date() });
+  for (const usuario of [pasajero, conductor.userId]) {
+    await obtenerHistorialViajes({ query: {}, user: { id: usuario } }, respuesta);
+    comprobar.equal(respuesta.codigo, 200);
+    const entradaHistorial = respuesta.datos.rides[0];
+    comprobar.equal(entradaHistorial.id, viaje.id);
+    comprobar.equal(entradaHistorial.passengerId, pasajero);
+    comprobar.equal(entradaHistorial.passenger.name, 'Ana María Paz');
+    comprobar.equal(entradaHistorial.driver.user.name, 'Luis Alberto Vargas Rojas');
+  }
+});
+
+baseDatosTest('recupera el viaje confirmado o la cancelación del último viaje por rol', async () => {
+  const { Conductor } = require('../../models');
+  const { obtenerViajeActivo } = require('../../controllers/viajeControlador');
+  const conductor = await Conductor.findByPk(cercanoConductor);
+  const consultar = async (usuarioId, role, ultimoViajeId) => {
+    const respuesta = { codigo: 200, status(codigo) { this.codigo = codigo; return this; }, json(datos) { this.datos = datos; } };
+    await obtenerViajeActivo({ user: { id: usuarioId }, query: { role, ultimoViajeId } }, respuesta);
+    comprobar.equal(respuesta.codigo, 200, JSON.stringify(respuesta.datos));
+    return respuesta.datos.ride;
+  };
+  const negociado = await Viaje.create({
+    passengerId: pasajero, driverId: conductor.id, requestMode: 'negociacion', status: 'aceptado',
+    pickupLocation: { type: 'Point', coordinates: [-68.15, -16.5] },
+    dropoffLocation: { type: 'Point', coordinates: [-68.15, -16.52] },
+    pickup_address: 'Recogida', dropoff_address: 'Destino', totalFare: 14, finalFare: 14,
+    distance: 1000, duration: 300
+  });
+  for (const estado of ['aceptado', 'llegado', 'en_curso']) {
+    await negociado.update({ status: estado });
+    comprobar.equal((await consultar(pasajero, 'pasajero')).id, negociado.id);
+    comprobar.equal((await consultar(conductor.userId, 'conductor')).id, negociado.id);
+  }
+  comprobar.equal(await consultar(segundoPasajero, 'pasajero'), null);
+  comprobar.equal(await consultar(conductor.userId, 'pasajero'), null);
+  comprobar.equal(await consultar(pasajero, 'conductor'), null);
+  await negociado.update({ status: 'cancelado', cancelledBy: 'conductor', cancelledAt: new Date() });
+  comprobar.equal(await consultar(pasajero, 'pasajero'), null);
+  comprobar.equal(await consultar(conductor.userId, 'conductor'), null);
+  const canceladoPorConductor = await consultar(pasajero, 'pasajero', negociado.id);
+  comprobar.equal(canceladoPorConductor.status, 'cancelado');
+  comprobar.equal(canceladoPorConductor.cancelledBy, 'conductor');
+  comprobar.equal(await consultar(segundoPasajero, 'pasajero', negociado.id), null);
+  comprobar.equal(await consultar(conductor.userId, 'pasajero', negociado.id), null);
+
+  const rapido = await servicio.reservar(pasajero, entrada());
+  comprobar.equal(await consultar(pasajero, 'pasajero'), null);
+  await rapido.update({ status: 'en_curso' });
+  comprobar.equal((await consultar(pasajero, 'pasajero')).id, rapido.id);
+  comprobar.equal((await consultar(conductor.userId, 'conductor')).id, rapido.id);
+  await rapido.update({ status: 'cancelado', cancelledBy: 'pasajero', cancelledAt: new Date() });
+  const canceladoPorPasajero = await consultar(conductor.userId, 'conductor', rapido.id);
+  comprobar.equal(canceladoPorPasajero.status, 'cancelado');
+  comprobar.equal(canceladoPorPasajero.cancelledBy, 'pasajero');
 });
 
 baseDatosTest('publica contraofertas nuevas y actualizadas y retira la solicitud al cancelar', async () => {
@@ -784,7 +898,52 @@ baseDatosTest('la zona conserva el atributo id al consultar las columnas renombr
   comprobar.equal(zona.id, id);
 });
 
-baseDatosTest('el recorrido se guarda en el viaje con la clave física id_viaje', async () => {
+baseDatosTest('la corrección administrativa del CI valida los cambios y los audita', async () => {
+  const { UsuarioIdentidad } = require('../../models');
+  const AuditoriaRegistro = require('../../models/AuditRegistro');
+  const { obtenerDatosIdentidad, corregirDatosIdentidad } = require('../../controllers/adminControlador');
+  const adminId = aleatorioUUID();
+  await db.query("INSERT INTO usuario (id, firebase_uid, role) VALUES (:id, :id, 'administrador')",
+    { replacements: { id: adminId } });
+  const identidad = await UsuarioIdentidad.create({
+    userId: pasajero, firstNames: 'Nombre OCR', ciNumber: '1234567', birthDate: '1990-01-01',
+    issueDate: '2020-01-01', expiryDate: '2030-01-01', verificationStatus: 'verificado'
+  });
+  await UsuarioIdentidad.create({
+    userId: segundoPasajero, firstNames: 'Otro nombre', ciNumber: '7654321', birthDate: '1990-01-01'
+  });
+  const consultar = async (controlador, body, id = adminId) => {
+    const respuesta = {
+      codigo: 200,
+      status(codigo) { this.codigo = codigo; return this; },
+      set() { return this; },
+      json(datos) { this.datos = datos; return this; }
+    };
+    await controlador({ params: { userId: pasajero }, user: { id }, body }, respuesta);
+    return respuesta;
+  };
+  comprobar.equal((await consultar(obtenerDatosIdentidad, undefined, pasajero)).codigo, 403);
+  const lectura = await consultar(obtenerDatosIdentidad);
+  comprobar.equal(lectura.codigo, 200);
+  const { revision } = lectura.datos;
+  comprobar.equal((await consultar(corregirDatosIdentidad, { revision, campos: { ciNumber: '7654321' } })).codigo, 409);
+  comprobar.equal((await consultar(corregirDatosIdentidad, { revision, campos: { issueDate: '31/02/2020' } })).codigo, 422);
+  const campos = { firstNames: 'Nombre correcto', ciNumber: '1234568', birthDate: '02/01/1990' };
+  comprobar.equal((await consultar(corregirDatosIdentidad, { revision, campos })).codigo, 200);
+  comprobar.equal((await consultar(corregirDatosIdentidad, { revision, campos })).codigo, 409);
+  const guardada = await UsuarioIdentidad.findOne({ where: { userId: pasajero } });
+  comprobar.equal(guardada.firstNames, campos.firstNames);
+  comprobar.equal(guardada.ciNumber, campos.ciNumber);
+  comprobar.equal(guardada.birthDate, '1990-01-02');
+  comprobar.equal(guardada.verificationStatus, 'verificado');
+  const registros = await AuditoriaRegistro.findAll({ where: { record_id: identidad.id } });
+  comprobar.equal(registros.length, 1);
+  comprobar.equal(registros[0].changed_by, adminId);
+  comprobar.equal(registros[0].old_values.ciNumber, '1234567');
+  comprobar.equal(registros[0].new_values.ciNumber, '1234568');
+});
+
+baseDatosTest('el recorrido se guarda y se entrega en el detalle del historial a sus participantes', async t => {
   const viaje = await servicio.reservar(pasajero, entrada());
   await Viaje.update({ status: 'en_curso' }, { where: { id: viaje.id } });
   const { registrarPunto } = require('../rutaRecorrida');
@@ -809,6 +968,126 @@ baseDatosTest('el recorrido se guarda en el viaje con la clave física id_viaje'
     esquemaFisico: true, replacements: { id: viaje.id }
   });
   comprobar.equal(fila.puntos, 4);
+
+  const { obtenerViajePorId, obtenerHistorialViajes } = require('../../controllers/viajeControlador');
+  const { Conductor, CancelacionMotivo } = require('../../models');
+  const conductor = await Conductor.findByPk(viaje.driverId);
+  const consultar = async (controlador, usuario, query = {}) => {
+    const respuesta = { codigo: 200, status(codigo) { this.codigo = codigo; return this; }, json(datos) { this.datos = datos; } };
+    await controlador({ params: { id: viaje.id }, user: { id: usuario }, query }, respuesta);
+    return respuesta;
+  };
+  const historial = { historial: '1' };
+  comprobar.equal((await consultar(obtenerViajePorId, pasajero, historial)).codigo, 404);
+  const motivo = await CancelacionMotivo.create({ code: 'prueba_detalle', description: 'Motivo de prueba', applicable_to: 'pasajero' });
+  await viaje.update({ status: 'cancelado', cancelledBy: 'pasajero', cancelledAt: new Date(), cancellation_reason_id: motivo.id });
+  for (const usuario of [pasajero, conductor.userId]) {
+    const detalle = await consultar(obtenerViajePorId, usuario, historial);
+    comprobar.equal(detalle.codigo, 200);
+    comprobar.equal(detalle.datos.status, 'cancelado');
+    comprobar.deepEqual(detalle.datos.rutaRecorrida.coordinates, [
+      [-68.15, -16.51], [-68.15, -16.51], [-68.15, -16.5], [-68.15, -16.51]
+    ]);
+  }
+  comprobar.equal((await consultar(obtenerViajePorId, segundoPasajero, historial)).codigo, 404);
+  comprobar.equal((await consultar(obtenerViajePorId, pasajero)).datos.rutaRecorrida, undefined);
+  const listado = await consultar(obtenerHistorialViajes, pasajero);
+  comprobar.equal(listado.codigo, 200);
+  comprobar.equal(listado.datos.rides[0].id, viaje.id);
+  comprobar.equal(listado.datos.rides[0].rutaRecorrida, undefined);
+
+  const express = require('express');
+  const jwt = require('jsonwebtoken');
+  const adminId = aleatorioUUID();
+  await db.query(`INSERT INTO public.usuario (id_usuario, firebase_uid, rol) VALUES (:id, :id, 'administrador')`,
+    { esquemaFisico: true, replacements: { id: adminId } });
+  const app = express();
+  app.use('/administracion', require('../../routes/administracion'));
+  const servidor = await new Promise(resolve => {
+    const instancia = app.listen(0, '127.0.0.1', () => resolve(instancia));
+  });
+  t.after(() => new Promise(resolve => servidor.close(resolve)));
+  const url = `http://127.0.0.1:${servidor.address().port}/administracion/viajes`;
+  const rutaRecorrido = `${url}/${viaje.id}/recorrido`;
+  const sesion = (id, role) => ({ headers: {
+    Authorization: 'Bearer ' + jwt.sign({ id, role }, process.env.JWT_SECRET || 'secret')
+  } });
+  const admin = sesion(adminId, 'administrador');
+  comprobar.equal((await fetch(rutaRecorrido)).status, 401);
+  comprobar.equal((await fetch(rutaRecorrido, sesion(pasajero, 'pasajero'))).status, 403);
+  comprobar.equal((await fetch(rutaRecorrido, sesion(conductor.userId, 'conductor'))).status, 403);
+  const recorridoAdmin = await fetch(rutaRecorrido, admin);
+  comprobar.equal(recorridoAdmin.status, 200);
+  comprobar.equal(recorridoAdmin.headers.get('cache-control'), 'private, no-store');
+  comprobar.deepEqual(await recorridoAdmin.json(), {
+    status: 'cancelado',
+    pickupLocation: { latitude: -16.5, longitude: -68.15 },
+    dropoffLocation: { latitude: -16.52, longitude: -68.15 },
+    rutaRecorrida: { type: 'LineString', coordinates: [
+      [-68.15, -16.51], [-68.15, -16.51], [-68.15, -16.5], [-68.15, -16.51]
+    ] }
+  });
+  const listadoAdmin = await fetch(url, admin);
+  comprobar.equal(listadoAdmin.status, 200);
+  comprobar.equal((await listadoAdmin.json()).rides[0].rutaRecorrida, undefined);
+  for (const [campo, id, otroId] of [['passengerId', pasajero, segundoPasajero], ['driverId', conductor.id, lejanoConductor]]) {
+    const listadoDePersona = await fetch(`${url}?${campo}=${id}`, admin);
+    comprobar.equal(listadoDePersona.status, 200);
+    comprobar.deepEqual((await listadoDePersona.json()).rides.map(item => item.id), [viaje.id]);
+    comprobar.deepEqual((await (await fetch(`${url}?${campo}=${otroId}`, admin)).json()).rides, []);
+  }
+  comprobar.equal((await fetch(`${url}?driverId=invalido`, admin)).status, 400);
+  const documentos = require('../documentosRepositorio');
+  const licenciaId = await documentos.createDocument({ driverId: conductor.id, tipo_documento: 'licenseFront',
+    ruta_archivo: 'licencia-prueba.jpg', estado_verificacion: 'verificado', vigente: true });
+  await documentos.insert('documento_licencia', { id_documento_licencia: licenciaId, numero_licencia: '1234567', fecha_vencimiento: '20/12/2030' });
+  const rutaFicha = url.replace(/\/viajes$/, `/gestion-conductores/${conductor.id}`);
+  comprobar.equal((await fetch(rutaFicha, sesion(pasajero, 'pasajero'))).status, 403);
+  const ficha = await fetch(rutaFicha, admin);
+  comprobar.equal(ficha.status, 200);
+  const datosFicha = await ficha.json();
+  comprobar.equal(datosFicha.usuarioId, conductor.userId);
+  comprobar.equal(datosFicha.licencia, '1234567');
+  comprobar.equal(datosFicha.vencimientoLicencia, '20/12/2030');
+  comprobar.equal(datosFicha.cuentaActiva, true);
+  comprobar.equal(datosFicha.viajeActivo, null);
+  comprobar.equal(datosFicha.disponible, true);
+  await db.query('UPDATE ubicacion_conductor SET is_online = false WHERE driver_id = :id',
+    { replacements: { id: conductor.id } });
+  const fichaFueraDeServicio = await fetch(rutaFicha, admin);
+  comprobar.equal(fichaFueraDeServicio.status, 200);
+  comprobar.equal((await fichaFueraDeServicio.json()).disponible, false);
+  const listadoConductores = await fetch(url.replace(/\/viajes$/, '/gestion-conductores'), admin);
+  comprobar.equal(listadoConductores.status, 200);
+  const { conductores } = await listadoConductores.json();
+  comprobar.equal(conductores.find(item => item.id === conductor.id).disponible, false);
+  comprobar.equal(conductores.find(item => item.id === lejanoConductor).disponible, true);
+  const rutaDetalle = `${url}/${viaje.id}`;
+  comprobar.equal((await fetch(rutaDetalle)).status, 401);
+  comprobar.equal((await fetch(rutaDetalle, sesion(pasajero, 'pasajero'))).status, 403);
+  comprobar.equal((await fetch(rutaDetalle, sesion(conductor.userId, 'conductor'))).status, 403);
+  const respuestaDetalle = await fetch(rutaDetalle, admin);
+  comprobar.equal(respuestaDetalle.status, 200);
+  comprobar.equal(respuestaDetalle.headers.get('cache-control'), 'private, no-store');
+  const detalleAdmin = await respuestaDetalle.json();
+  comprobar.equal(detalleAdmin.id, viaje.id);
+  comprobar.equal(detalleAdmin.driverId, viaje.driverId);
+  comprobar.equal(detalleAdmin.cancelledBy, 'pasajero');
+  comprobar.ok(detalleAdmin.cancelledAt);
+  comprobar.equal(detalleAdmin.cancellationReason, 'Motivo de prueba');
+  comprobar.equal(detalleAdmin.paymentMethod, 'efectivo');
+  comprobar.ok(detalleAdmin.passenger);
+  comprobar.ok(detalleAdmin.driver);
+  comprobar.deepEqual(detalleAdmin.waypoints.map(parada => parada.sequence), [1, 2]);
+  comprobar.equal(detalleAdmin.rutaRecorrida.coordinates.length, 4);
+  await viaje.update({ status: 'en_curso' });
+  const fichaConViaje = await fetch(rutaFicha, admin);
+  comprobar.equal(fichaConViaje.status, 200);
+  comprobar.deepEqual((await fichaConViaje.json()).viajeActivo, { id: viaje.id, estado: 'en_curso' });
+  await db.query('UPDATE public.usuario SET activo = false WHERE id_usuario = :id',
+    { esquemaFisico: true, replacements: { id: adminId } });
+  comprobar.equal((await fetch(rutaRecorrido, admin)).status, 403);
+  comprobar.equal((await fetch(rutaDetalle, admin)).status, 403);
 });
 
 baseDatosTest(
@@ -1259,11 +1538,26 @@ baseDatosTest('tasas por zona se configuran, se aplican a cada ganancia y conser
  const two=await CobrosConductor.create({ride_id:rideB.id,commission_rate:0.99});await two.reload();comprobar.equal(Number(two.commission_rate),0.05);comprobar.equal(Number(two.commission_amount),5);
  const response=()=>({codigo:200,status(c){this.codigo=c;return this;},json(v){this.datos=v;return this;}});
  for(const value of [-1,1.1,null,'0.1234567']){const res=response();await controller.actualizar({params:{zoneId:a.id_zona_servicio},body:{tasa_comision:value},user:{id:segundoPasajero}},res);comprobar.equal(res.codigo,400);}
- const updated=response();await controller.actualizar({params:{zoneId:a.id_zona_servicio},body:{tasa_comision:0.03},user:{id:segundoPasajero}},updated);comprobar.equal(updated.codigo,200,JSON.stringify(updated.datos));
+ const editarZona = async body => {
+   const res = response();
+   await controller.actualizar({ params: { zoneId: a.id_zona_servicio }, body, user: { id: segundoPasajero } }, res);
+   return res;
+ };
+ comprobar.equal((await editarZona({ tarifa_base: -1, tasa_comision: 0.04 })).codigo, 400);
+ const updated = await editarZona({ tasa_comision: 0.03, tarifa_base: 9, tarifa_km: 1.25, tarifa_minuto: 0.7 });
+ comprobar.equal(updated.codigo, 200, JSON.stringify(updated.datos));
  await one.reload();comprobar.equal(Number(one.commission_rate),0.02);comprobar.equal(Number(one.commission_amount),2);
  const next=await Viaje.create({...ride.get({plain:true}),id:aleatorioUUID(),requestKey:aleatorioUUID()});const three=await CobrosConductor.create({ride_id:next.id});await three.reload();comprobar.equal(Number(three.commission_rate),0.03);
  await comprobar.rejects(one.update({commission_rate:0.5}));
  const list=response();await controller.listar({},list);comprobar.equal(list.codigo,200);comprobar.equal(list.datos.zonas.length,2);
+ comprobar.deepEqual(list.datos.zonas[0], { id: a.id_zona_servicio, nombre: 'Zona A', activa: true,
+   tasa_comision: 0.03, tarifa_base: 9, tarifa_km: 1.25, tarifa_minuto: 0.7, moneda: 'BOB' });
+ const nuevaReserva = await servicio.reservar(segundoPasajero, entrada());
+ comprobar.deepEqual([nuevaReserva.baseFare, nuevaReserva.farePerKm, nuevaReserva.farePerMinute], [9, 1.25, 0.7]);
+ comprobar.equal((await editarZona({ tarifa_minuto: null })).codigo, 200);
+ const tarifas = response();
+ await require('../../controllers/viajeControlador').obtenerConfiguracionTarifas({ query: { lat: -16.5, lng: -68.15 } }, tarifas);
+ comprobar.deepEqual([tarifas.datos.baseFare, tarifas.datos.farePerKm, tarifas.datos.farePerMinute], [9, 1.25, 0.58]);
  const noZone=await Viaje.create({...ride.get({plain:true}),id:aleatorioUUID(),requestKey:aleatorioUUID(),service_area_id:null,pickupLocation:{type:'Point',coordinates:[0,0]}});
  await comprobar.rejects(CobrosConductor.create({ride_id:noZone.id}),/zona de servicio/);
 });
@@ -1290,12 +1584,71 @@ baseDatosTest('comisión mensual calcula fechas y estado en Bolivia sin columnas
  const columns=await repo.select("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='comision'");comprobar.equal(columns.some(c=>['fin_periodo','fecha_limite','estado'].includes(c.column_name)),false);
  await comprobar.rejects(ComisionLiquidacion.create({driver_id:cercanoConductor,period_start:'2026-10-01'}));
 });
+baseDatosTest('desactivar una cuenta bloquea su sesión y sus accesos por Firebase', async t => {
+  const express = require('express');
+  const jwt = require('jsonwebtoken');
+  const socket = require('../../socket');
+  const { socketAutenticacionIntermediario } = require('../../socket/middleware/autenticacion');
+  const desconectar = t.mock.method(socket, 'desconectarCuentaDesactivada', () => {});
+  const tokenUsuario = jwt.sign({ id: pasajero, role: 'pasajero' }, process.env.JWT_SECRET || 'secret');
+  const tokenAdmin = jwt.sign({ id: segundoPasajero, role: 'administrador' }, process.env.JWT_SECRET || 'secret');
+  const app = express();
+  app.use(express.json());
+  app.use('/autenticacion', require('../../routes/autenticacion'));
+  app.use('/administracion', require('../../routes/administracion'));
+  const servidor = await new Promise(resolve => {
+    const instancia = app.listen(0, '127.0.0.1', () => resolve(instancia));
+  });
+  t.after(() => new Promise(resolve => servidor.close(resolve)));
+  const llamar = async (ruta, token, method = 'GET', datos) => fetch('http://127.0.0.1:' + servidor.address().port + ruta, {
+    method,
+    headers: { ...(token ? { Authorization: 'Bearer ' + token } : {}), 'Content-Type': 'application/json' },
+    body: datos ? JSON.stringify(datos) : undefined
+  });
+  const conectar = () => new Promise(resolve =>
+    socketAutenticacionIntermediario({ handshake: { auth: { token: tokenUsuario } } }, resolve));
+  comprobar.equal((await llamar('/autenticacion/sesion', tokenUsuario)).status, 200);
+  comprobar.equal(await conectar(), undefined);
+
+  const usuarioRuta = '/administracion/usuarios/' + pasajero;
+  comprobar.equal((await llamar(usuarioRuta, tokenUsuario)).status, 403);
+  const usuarioActivo = await llamar(usuarioRuta, tokenAdmin);
+  comprobar.equal(usuarioActivo.status, 200);
+  comprobar.equal((await usuarioActivo.json()).usuario.activo, true);
+  comprobar.equal((await llamar(usuarioRuta, tokenAdmin, 'DELETE', { motivo: 'Prueba de acceso' })).status, 200);
+  const usuarioInactivo = await (await llamar(usuarioRuta, tokenAdmin)).json();
+  comprobar.equal(usuarioInactivo.usuario.activo, false);
+  comprobar.equal(usuarioInactivo.historial[0].motivo, 'Prueba de acceso');
+  comprobar.deepEqual(desconectar.mock.calls.map(llamada => llamada.arguments), [[pasajero]]);
+  for (const [ruta, metodo] of [['/autenticacion/sesion', 'GET'], ['/autenticacion/renovar', 'POST']]) {
+    const respuesta = await llamar(ruta, tokenUsuario, metodo);
+    comprobar.equal(respuesta.status, 403);
+    comprobar.equal((await respuesta.json()).code, 'CUENTA_DESACTIVADA');
+  }
+  comprobar.equal((await conectar()).data.code, 'CUENTA_DESACTIVADA');
+  const comprobacionFirebase = await llamar('/autenticacion/comprobar-firebase/' + pasajero);
+  comprobar.equal(comprobacionFirebase.status, 403);
+  comprobar.equal((await comprobacionFirebase.json()).token, undefined);
+  const verificarTelefono = await llamar('/autenticacion/verificar-telefono', null, 'POST', {
+    firebaseUid: pasajero, phone: '+59170000001', email: 'cuenta@example.test'
+  });
+  comprobar.equal(verificarTelefono.status, 403);
+  comprobar.equal((await verificarTelefono.json()).token, undefined);
+  comprobar.equal((await llamar(usuarioRuta + '/habilitar', tokenAdmin, 'PUT')).status, 200);
+  comprobar.equal((await llamar('/autenticacion/sesion', tokenUsuario)).status, 200);
+});
+
 baseDatosTest('notificaciones calculan lectura desde la fecha y las rutas conservan conteos y propiedad',async()=>{
  const {Notificacion}=require('../../models');const express=require('express'),jwt=require('jsonwebtoken');
- const first=await Notificacion.create({user_id:pasajero,title:'Primera',body:'Prueba',type:'sistema'});
+ const first=await Notificacion.create({user_id:pasajero,title:'Viaje cancelado',body:'Aviso guardado anteriormente',type:'viaje_cancelado'});
  const second=await Notificacion.create({user_id:pasajero,title:'Segunda',body:'Prueba',type:'sistema'});
  const other=await Notificacion.create({user_id:segundoPasajero,title:'Otro usuario',body:'Prueba',type:'sistema'});
  comprobar.equal(first.is_read,false);
+ const viaje = await servicio.reservar(pasajero, entrada());
+ const { notificarConductorLlegado, notificarViajeCancelado } = require('../notificacionServicio');
+ await notificarConductorLlegado(pasajero, viaje, 'Conductor de prueba');
+ await notificarViajeCancelado(pasajero, viaje, 'conductor');
+ comprobar.equal(await Notificacion.count({ where: { user_id: pasajero } }), 2);
  const app=express();app.use(express.json());app.use('/notificaciones',require('../../routes/notificaciones'));
  const server=await new Promise(resolve=>{const s=app.listen(0,'127.0.0.1',()=>resolve(s));});
  try{
@@ -1308,9 +1661,129 @@ baseDatosTest('notificaciones calculan lectura desde la fecha y las rutas conser
   await call('/'+first.id+'/leer','PATCH');await first.reload();comprobar.equal(first.read_at.toISOString(),date);
   const all=await call('/leer-todas','PATCH');comprobar.equal(all.marked,1);comprobar.equal((await call()).unread_count,0);
   await other.reload();comprobar.equal(other.is_read,false);comprobar.equal(other.read_at,null);
-  const [cols]=await db.query("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='notificacion'",{esquemaFisico:true});comprobar.equal(cols.some(c=>c.column_name==='leida'),false);
+  const [cols]=await db.query("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='notificacion'",{esquemaFisico:true});comprobar.equal(cols.some(c=>['leida','enviado_en'].includes(c.column_name)),false);
  }finally{await new Promise((resolve,reject)=>server.close(e=>e?reject(e):resolve()));}
 });
+baseDatosTest('envíos administrativos respetan el público, se guardan en la bandeja y no se duplican', async t => {
+  const express = require('express');
+  const jwt = require('jsonwebtoken');
+  const { Conductor, UsuarioIdentidad } = require('../../models');
+  const servicioNotificaciones = require('../notificacionServicio');
+  const push = t.mock.method(servicioNotificaciones, 'enviarPush', async () => true);
+  const adminId = aleatorioUUID();
+  await db.query(`INSERT INTO public.usuario(id_usuario, firebase_uid, rol, correo)
+    VALUES (:id, :id, 'administrador', 'admin-avisos@example.test')`,
+  { esquemaFisico: true, replacements: { id: adminId } });
+  const conductor = await Conductor.findByPk(cercanoConductor);
+  await db.query(`UPDATE public.usuario SET modo_actual = 'conductor' WHERE rol = 'conductor'`,
+    { esquemaFisico: true });
+  await db.query(`UPDATE public.usuario SET fcm_token = 'token-falso-prueba' WHERE id_usuario = :id`,
+    { esquemaFisico: true, replacements: { id: conductor.userId } });
+  await UsuarioIdentidad.create({ userId: pasajero, firstNames: 'Ana', paternalSurname: 'Paz',
+    ciNumber: '12345678', birthDate: '1995-01-01' });
+
+  const app = express();
+  app.use(express.json());
+  app.use('/administracion', require('../../routes/administracion'));
+  app.use('/notificaciones', require('../../routes/notificaciones'));
+  const servidor = await new Promise(resolve => {
+    const instancia = app.listen(0, '127.0.0.1', () => resolve(instancia));
+  });
+  t.after(() => new Promise(resolve => servidor.close(resolve)));
+  const origen = 'http://127.0.0.1:' + servidor.address().port;
+  const encabezados = (id, role) => ({
+    Authorization: 'Bearer ' + jwt.sign({ id, role }, process.env.JWT_SECRET || 'secret'),
+    'Content-Type': 'application/json'
+  });
+  const admin = encabezados(adminId, 'administrador');
+  const usuario = encabezados(pasajero, 'pasajero');
+  const chofer = encabezados(conductor.userId, 'conductor');
+  const ruta = '/administracion/notificaciones';
+  const llamar = async (path, headers, codigo, body, method = body ? 'POST' : 'GET') => {
+    const respuesta = await fetch(origen + path, { headers, method, body: body ? JSON.stringify(body) : undefined });
+    const datos = await respuesta.json();
+    comprobar.equal(respuesta.status, codigo, JSON.stringify(datos));
+    return datos;
+  };
+  const aviso = { titulo: 'Aviso de prueba', mensaje: 'Texto sin emojis.' };
+  const previa = (alcance, destinatarioId) =>
+    llamar(ruta + '/vista-previa', admin, 200, { ...aviso, alcance, destinatarioId });
+
+  await llamar(ruta + '/vista-previa', {}, 401, { ...aviso, alcance: 'pasajeros' });
+  await llamar(ruta + '/vista-previa', usuario, 403, { ...aviso, alcance: 'pasajeros' });
+  await llamar(ruta, usuario, 403);
+  await llamar(ruta + '/vista-previa', admin, 400, { ...aviso, alcance: 'todos' });
+  await llamar(ruta + '/vista-previa', admin, 400, { ...aviso, titulo: '🚕 Aviso', alcance: 'pasajeros' });
+  const encontrados = await llamar(ruta + '/destinatarios?q=Ana', admin, 200);
+  comprobar.deepEqual(encontrados.destinatarios.map(persona => persona.id), [pasajero]);
+
+  const individual = await previa('individual', pasajero);
+  comprobar.equal(individual.total, 1);
+  comprobar.equal((await llamar('/notificaciones', usuario, 200)).unread_count, 0);
+  const confirmaciones = await Promise.all([1, 2].map(() => fetch(origen + ruta, {
+    method: 'POST', headers: admin, body: JSON.stringify({ token: individual.token })
+  })));
+  comprobar.deepEqual(confirmaciones.map(r => r.status).sort(), [200, 201]);
+  const bandeja = await llamar('/notificaciones', usuario, 200);
+  comprobar.equal(bandeja.unread_count, 1);
+  comprobar.equal(bandeja.data[0].title, aviso.titulo);
+  comprobar.equal(bandeja.data[0].body, aviso.mensaje);
+  comprobar.equal(bandeja.data[0].is_read, false);
+  comprobar.equal((await llamar('/notificaciones', chofer, 200)).data.length, 0);
+  const leer = '/notificaciones/' + bandeja.data[0].id + '/leer';
+  await llamar(leer, chofer, 404, undefined, 'PATCH');
+  comprobar.equal((await llamar(leer, usuario, 200, undefined, 'PATCH')).unread_count, 0);
+  comprobar.equal((await llamar('/notificaciones', usuario, 200)).data[0].is_read, true);
+
+  const pasajeros = await previa('pasajeros');
+  comprobar.equal(pasajeros.total, 4);
+  await db.query('UPDATE public.usuario SET activo = false WHERE id_usuario = :id',
+    { esquemaFisico: true, replacements: { id: segundoPasajero } });
+  await llamar(ruta, admin, 409, { token: pasajeros.token });
+  const pasajerosActivos = await llamar(ruta + '/vista-previa', admin, 200,
+    { ...aviso, alcance: 'pasajeros', titulo: 'Aviso para pasajeros' });
+  comprobar.equal(pasajerosActivos.total, 3);
+  const envioPasajeros = await llamar(ruta, admin, 201, { token: pasajerosActivos.token });
+  comprobar.equal((await llamar('/notificaciones', chofer, 200)).unread_count, 0);
+
+  const cambiarModo = modo => db.query('UPDATE public.usuario SET modo_actual = :modo WHERE id_usuario = :id',
+    { esquemaFisico: true, replacements: { modo, id: conductor.userId } });
+  await cambiarModo('pasajero');
+  const conductores = await previa('conductores');
+  comprobar.equal(conductores.total, 2);
+  const envioConductores = await llamar(ruta, admin, 201, { token: conductores.token });
+  const bandejaPasajero = await llamar('/notificaciones', chofer, 200);
+  comprobar.deepEqual(bandejaPasajero.data.map(n => n.title), ['Aviso para pasajeros']);
+  comprobar.equal(bandejaPasajero.unread_count, 1);
+  comprobar.equal((await llamar('/notificaciones/leer-todas', chofer, 200, undefined, 'PATCH')).marked, 1);
+  await cambiarModo('conductor');
+  const bandejaConductor = await llamar('/notificaciones?unread=true', chofer, 200);
+  comprobar.deepEqual(bandejaConductor.data.map(n => n.title), [aviso.titulo]);
+  comprobar.equal(bandejaConductor.unread_count, 1);
+  await llamar(`/notificaciones/${bandejaPasajero.data[0].id}/leer`, chofer, 404, undefined, 'PATCH');
+  const anterior = await llamar('/notificaciones?limit=1&offset=1', usuario, 200);
+  comprobar.equal(anterior.data.length, 1);
+  comprobar.equal(anterior.data[0].id, bandeja.data[0].id);
+
+  let envios = [];
+  for (let intento = 0; intento < 30; intento += 1) {
+    ({ envios } = await llamar(ruta, admin, 200));
+    if (envios.find(envio => envio.id === envioConductores.envioId)?.aceptados === 1) break;
+    await new Promise(resolve => setTimeout(resolve, 30));
+  }
+  const aConductores = envios.find(envio => envio.id === envioConductores.envioId);
+  const aPasajeros = envios.find(envio => envio.id === envioPasajeros.envioId);
+  comprobar.equal(aConductores.aceptados, 1);
+  comprobar.equal(aConductores.omitidos, 1);
+  comprobar.equal(aPasajeros.aceptados, 1);
+  comprobar.equal(aPasajeros.omitidos, 2);
+  comprobar.equal(aPasajeros.administrador, 'admin-avisos@example.test');
+  comprobar.equal(push.mock.callCount(), 2);
+  await llamar('/notificaciones', encabezados(segundoPasajero, 'pasajero'), 403);
+  comprobar.equal(await require('../../models').Notificacion.count({ where: { user_id: segundoPasajero } }), 0);
+  comprobar.equal((await llamar('/notificaciones/leer-todas', chofer, 200, undefined, 'PATCH')).unread_count, 0);
+});
+
 baseDatosTest('pago obtiene el método del viaje y rechaza registrar uno diferente',async()=>{
  const {Pago}=require('../../models');const repo=require('../documentosRepositorio');const controller=require('../../controllers/pagoControlador');
  const ride=await servicio.reservar(pasajero,entrada());await Viaje.update({paymentMethod:'qr'},{where:{id:ride.id}});

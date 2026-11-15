@@ -7,9 +7,12 @@ const { autenticacionIntermediario: autenticacionIntermediario } = require("../m
 const rapidoAsignacion = require("../controllers/rapidaAsignacionControlador");
 const rapidoAcceso = require("../middleware/rapidaViajeAccess");
 const { obtenerViajeRuta: obtenerViajeRuta } = require("../controllers/viajeRutaControlador");
-const { registrarEmergenciaViaje } = require('../controllers/emergenciaViajeControlador');
+const { registrarEmergenciaViaje, obtenerMiEmergencia } = require('../controllers/emergenciaViajeControlador');
+const { crearEnlace } = require('../controllers/viajeCompartidoControlador');
 
 enrutador.post('/:rideId/emergencia', autenticacionIntermediario, registrarEmergenciaViaje);
+enrutador.get('/:rideId/emergencia', autenticacionIntermediario, obtenerMiEmergencia);
+enrutador.post('/:rideId/compartir', autenticacionIntermediario, crearEnlace);
 
 enrutador.post('/rapida/reservar', autenticacionIntermediario, verificadoIdentidad, rapidoAsignacion.reservar);
 enrutador.get('/rapida/actual', autenticacionIntermediario, rapidoAsignacion.actual);

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Viaje compartido · Línea Lila</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous">
+  <link rel="stylesheet" href="/viaje-compartido/estilos.css?v=6">
+  <script defer src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
+  <script defer src="/viaje-compartido/mapa.js?v=5"></script>
+</head>
+<body>
+  <header class="cabecera">
+    <div class="cabecera-contenido">
+      <h1>Viaje compartido</h1>
+      <img class="marca" src="/viaje-compartido/logo-lila.png" width="40" height="40" alt="Línea Lila">
+    </div>
+  </header>
+  <main>
+    <div class="seguimiento">
+      <section class="resumen" aria-label="Estado del viaje">
+        <div class="resumen-cabecera">
+          <div class="estado" id="indicador" data-estado="espera">
+            <span class="punto-estado" aria-hidden="true"></span>
+            <p id="estado" role="status">Buscando la ubicación del vehículo…</p>
+          </div>
+          <button class="alternar-detalles" id="alternar-detalles" type="button" aria-expanded="true"
+            aria-controls="contenido-viaje" aria-label="Ocultar detalles" hidden>
+            <span aria-hidden="true"></span>
+          </button>
+        </div>
+        <div id="contenido-viaje">
+          <div class="actualizacion" id="actualizacion" hidden>
+            <p class="etiqueta">Última ubicación recibida</p>
+            <time id="hora"></time>
+          </div>
+          <dl class="detalles" id="detalles" hidden>
+            <div><dt>Pasajero</dt><dd id="pasajero"></dd></div>
+            <div><dt>Conductor</dt><dd id="conductor"></dd></div>
+            <div><dt>Vehículo</dt><dd id="vehiculo"></dd></div>
+            <div><dt>Placa</dt><dd id="placa" class="placa"></dd></div>
+          </dl>
+        </div>
+      </section>
+      <section class="tarjeta-mapa" id="tarjeta-mapa" aria-label="Ubicación del vehículo" hidden>
+        <div class="marco-mapa">
+          <div id="mapa"></div>
+          <button id="centrar" type="button" aria-label="Centrar en el vehículo" title="Centrar en el vehículo" hidden>
+            <span class="mira" aria-hidden="true"></span>
+          </button>
+        </div>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

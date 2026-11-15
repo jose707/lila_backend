@@ -183,10 +183,17 @@ const actualizarRealModo = async (solicitud, respuesta) => {
     if (realModo === 'conductor') {
       const Conductor = require("../models/Conductor");
       const conductor = await Conductor.findOne({
-        where: { userId: usuarioId, status: 'aprobado' }
+        where: { userId: usuarioId },
+        attributes: ['status']
       });
 
-      if (!conductor) {
+      if (conductor?.status === 'suspendido') {
+        return respuesta.status(403).json({
+          error: 'Tu permiso para conducir está suspendido.'
+        });
+      }
+
+      if (conductor?.status !== 'aprobado') {
         return respuesta.status(403).json({
           error:
           'No tienes permisos para ser conductor. Tu solicitud de registro aún no ha sido aprobada.'

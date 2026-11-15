@@ -90,6 +90,8 @@ aplicacion.use('/api/pagos', require('./routes/pagos'));
 aplicacion.use('/api/administracion', require('./routes/administracion'));
 aplicacion.use('/api/notificaciones', require('./routes/notificaciones'));
 
+aplicacion.use('/viaje-compartido', require('./routes/viajeCompartido'));
+
 // Health check
 aplicacion.get('/salud', (solicitud, respuesta) => {
   respuesta.status(200).json({
@@ -160,6 +162,7 @@ const inicioServidor = async () => {
     }, 1000);
     reservaTemporizador.unref();
     httpServidor.listen(PORT, () => {
+      require('./controllers/notificacionesAdminControlador').iniciarEnviosPush();
       require('./jobs/liquidacionJobs').iniciarCronJobs();
       console.log(`Servidor ejecutándose en http://localhost:${PORT}`);
       console.log(`Entorno: ${process.env.NODE_ENV || 'development'}`);

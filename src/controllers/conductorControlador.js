@@ -3,6 +3,7 @@ const Conductor = require("../models/Conductor");
 const Vehiculo = require("../models/Vehiculo");
 const ConductorSolicitud = require("../models/ConductorSolicitud");
 const SolicitudArchivo = require("../models/SolicitudArchivo");
+const documentosRepositorio = require('../services/documentosRepositorio');
 const fs = require('fs');
 const ruta = require('path');
 
@@ -58,7 +59,30 @@ const obtenerConductorEstado = async (solicitud, respuesta) => {
 
     // Obtener datos del vehículo (incluye estado RUAT)
     const vehiculo = await Vehiculo.findOne({ where: { driver_id: conductor.id } });
-    const ruatDocumento = vehiculo ? await require('./documentosRenovacionControlador').latestVehicleFile(vehiculo.id,'ruatPhoto') : null;
+    const [ruatDocumento, documentos] = await Promise.all([
+      vehiculo ? require('./documentosRenovacionControlador').latestVehicleFile(vehiculo.id, 'ruatPhoto') : null,
+      documentosRepositorio.select(`
+        (SELECT 'licencia' AS tipo, l.fecha_vencimiento AS vencimiento, l.fecha_emision_detectada AS inicio
+         FROM public.conductor_documento cd
+         JOIN public.documento d USING (id_documento)
+         LEFT JOIN public.documento_licencia l ON l.id_documento_licencia = d.id_documento
+         WHERE cd.id_conductor = :conductorId AND d.tipo_documento = 'licenseFront'
+           AND d.vigente AND d.estado_verificacion = 'verificado'
+         ORDER BY d.creado_en DESC, d.id_documento DESC LIMIT 1)
+        UNION ALL
+        (SELECT 'soat' AS tipo, s.fecha_vencimiento AS vencimiento, s.fecha_inicio AS inicio
+         FROM public.vehiculo_documento vd
+         JOIN public.documento d USING (id_documento)
+         LEFT JOIN public.documento_soat s ON s.id_documento_soat = d.id_documento
+         WHERE vd.id_vehiculo = :vehiculoId AND d.tipo_documento = 'soatPhoto'
+           AND d.vigente AND d.estado_verificacion = 'verificado'
+         ORDER BY d.creado_en DESC, d.id_documento DESC LIMIT 1)
+      `, { conductorId: conductor.id, vehiculoId: vehiculo?.id ?? null })
+    ]);
+    const documentosVerificados = { licencia: null, soat: null };
+    for (const { tipo, vencimiento, inicio } of documentos) {
+      documentosVerificados[tipo] = { vencimiento, inicio };
+    }
 
     // Usuario tiene solicitud
     respuesta.status(200).json({
@@ -72,12 +96,16 @@ const obtenerConductorEstado = async (solicitud, respuesta) => {
         vehiclePlate: conductor.vehiclePlate,
         rejectionReason: conductor.rejectionReason,
         documents: conductor.documents,
+        documentosVerificados,
         createdAt: conductor.createdAt,
         vehicle: vehiculo ?
         {
           id: vehiculo.id,
+          model: vehiculo.model,
+          plate: vehiculo.plate,
           ruatFile: ruatDocumento?.status !== 'rechazado' ?
           ruatDocumento?.filename || null : null,
+          ruatStatus: ruatDocumento?.status || null,
           ruatVerified: vehiculo.ruatVerified,
           ruatVerifiedAt: vehiculo.ruatVerifiedAt,
         } :

@@ -115,8 +115,8 @@ function validarIdentidad(frontal, reverso, hoy = boliviaHoy()) {
     maternalSurname: apellidoPartes.slice(1).join(' ') || null,
     ciNumber: f.ciNumber,
     birthDate: nacimientoFecha, issueDate: emisionFecha, expiryDate: vencimientoFecha,
-    ...Object.fromEntries(['birthPlace', 'address', 'occupation', 'maritalStatus', 'bloodType'].map((clave) => [clave, segundo[clave] || f[clave] || null]))
+    ...Object.fromEntries(['birthPlace', 'address', 'occupation', 'maritalStatus'].map((clave) => [clave, segundo[clave] || f[clave] || null]))
   };
 }
 
-module.exports = { isoFecha: isoFecha, comprobarAdulto: comprobarAdulto, compararIdentidadMrz: compararIdentidadMrz, validarIdentidad: validarIdentidad };
+module.exports = { isoFecha, boliviaHoy, comprobarAdulto, compararIdentidadMrz, validarIdentidad };

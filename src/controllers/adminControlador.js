@@ -5,6 +5,9 @@ const Conductor = require("../models/Conductor");
 const Vehiculo = require("../models/Vehiculo");
 const Viaje = require("../models/Viaje");
 const Pago = require("../models/Pago");
+const CancelacionMotivo = require('../models/CancelacionMotivo');
+const ServicioZona = require('../models/ServiceZona');
+const ViajeParada = require('../models/ViajeParada');
 const ConductorSolicitud = require("../models/ConductorSolicitud");
 const ConductorDomicilio = require("../models/ConductorDomicilio");
 const SolicitudArchivo = require("../models/SolicitudArchivo");
@@ -13,6 +16,8 @@ const sequelize = require("../config/baseDatos");
 const { Op: Operador } = require('sequelize');
 const ruta = require('path');
 const fs = require('fs/promises');
+const { createHash } = require('node:crypto');
+const { isoFecha, boliviaHoy, comprobarAdulto } = require('../services/identidadValidacion');
 const { CONDUCTOR_OCR_DOCUMENTOS: CONDUCTOR_OCR_DOCUMENTS } = require("../services/conductorOcrImage");
 
 // Admin-only preview of the exact JPEG buffer sent to Vision for driver OCR.
@@ -64,6 +69,97 @@ const obtenerIdentidadEvidencia = async (solicitud, respuesta) => {
   } catch (error) {
     console.error('Error al servir CI para revisión:', error.name || 'Error');
     return respuesta.sendStatus(503);
+  }
+};
+
+const camposIdentidad = [
+  ['ciNumber', 'Número de CI', 20], ['firstNames', 'Nombres', 150],
+  ['paternalSurname', 'Apellido paterno', 100], ['maternalSurname', 'Apellido materno', 100],
+  ['birthDate', 'Fecha de nacimiento'], ['issueDate', 'Fecha de emisión'], ['expiryDate', 'Fecha de vencimiento'],
+  ['birthPlace', 'Lugar de nacimiento', 150], ['address', 'Domicilio', 255],
+  ['occupation', 'Ocupación', 150], ['maritalStatus', 'Estado civil', 50]
+];
+
+function presentarDatosIdentidad(identidad) {
+  const campos = camposIdentidad.map(([clave, etiqueta, maximo]) => ({
+    clave, etiqueta, maximo, tipo: maximo ? 'texto' : 'fecha', valor: identidad[clave] ?? ''
+  }));
+  const revision = createHash('sha256').update(JSON.stringify([identidad.id, campos])).digest('hex');
+  return { campos, revision };
+}
+
+const consultarDatosIdentidad = editar => async (solicitud, respuesta) => {
+  const { userId } = solicitud.params;
+  const { revision, campos } = solicitud.body ?? {};
+  const fallar = (status, message) => { throw Object.assign(new Error(message), { status }); };
+  respuesta.set('Cache-Control', 'private, no-store');
+  if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(userId)) {
+    return respuesta.status(400).json({ error: 'Identificador de usuario inválido.' });
+  }
+  try {
+    const administrador = await Usuario.findOne({
+      attributes: ['id'], where: { id: solicitud.user.id, role: 'administrador', isActive: true }
+    });
+    if (!administrador) return respuesta.status(403).json({ error: 'Se requiere una cuenta de administrador activa.' });
+
+    const cargar = async transaccion => {
+      const identidad = await UsuarioIdentidad.findOne({ where: { userId }, transaction: transaccion });
+      if (!identidad) fallar(404, 'El usuario aún no tiene un CI registrado.');
+      return identidad;
+    };
+    if (!editar) return respuesta.json(presentarDatosIdentidad(await cargar()));
+    if (typeof revision !== 'string' || !campos || typeof campos !== 'object' || Array.isArray(campos)) {
+      return respuesta.status(400).json({ error: 'Los datos de la corrección no son válidos.' });
+    }
+
+    const resultado = await sequelize.transaction(async transaccion => {
+      // El registro inicial del CI también bloquea la fila del usuario.
+      const usuario = await Usuario.findByPk(userId, { transaction: transaccion, lock: transaccion.LOCK.UPDATE });
+      if (!usuario) fallar(404, 'Usuario no encontrado.');
+      const identidad = await cargar(transaccion);
+      if (presentarDatosIdentidad(identidad).revision !== revision) {
+        fallar(409, 'Los datos del CI cambiaron. Cierra la edición y vuelve a abrirla.');
+      }
+
+      const cambios = {};
+      const anteriores = {};
+      for (const [clave, entrada] of Object.entries(campos)) {
+        const campo = camposIdentidad.find(([nombre]) => nombre === clave);
+        if (!campo || typeof entrada !== 'string') fallar(400, 'La corrección contiene un campo inválido.');
+        const [, etiqueta, maximo] = campo;
+        const texto = entrada.trim();
+        const valor = maximo ? texto || null : isoFecha(texto);
+        if (texto && (!valor || texto.length > (maximo ?? 10))) fallar(422, etiqueta + ' no es válido.');
+        if (valor === identidad[clave]) continue;
+        if (['firstNames', 'ciNumber', 'birthDate'].includes(clave) && !valor) fallar(422, 'Completa el campo ' + etiqueta + '.');
+        if (clave === 'ciNumber' && !/^\d+$/.test(valor)) fallar(422, 'El número de CI debe contener solo dígitos.');
+        cambios[clave] = valor;
+        anteriores[clave] = identidad[clave];
+      }
+      if (!Object.keys(cambios).length) return presentarDatosIdentidad(identidad);
+      const datos = { ...identidad.get(), ...cambios };
+      if ('birthDate' in cambios) comprobarAdulto(datos.birthDate);
+      if (('issueDate' in cambios || 'birthDate' in cambios) && datos.issueDate &&
+          (datos.issueDate > boliviaHoy() || datos.issueDate < datos.birthDate)) {
+        fallar(422, 'La fecha de emisión debe estar entre el nacimiento y hoy.');
+      }
+      if (('expiryDate' in cambios || 'issueDate' in cambios) && datos.expiryDate && datos.issueDate &&
+          datos.expiryDate < datos.issueDate) {
+        fallar(422, 'El vencimiento debe ser igual o posterior a la fecha de emisión.');
+      }
+      await identidad.update(cambios, { transaction: transaccion });
+      await AuditoriaRegistro.create({
+        table_name: 'documento_ci', record_id: identidad.id, action: 'ACTUALIZACION',
+        old_values: anteriores, new_values: { tipo: 'correccion_ci', ...cambios }, changed_by: solicitud.user.id
+      }, { transaction: transaccion });
+      return presentarDatosIdentidad(identidad);
+    });
+    return respuesta.json(resultado);
+  } catch (error) {
+    if (error.original?.code === '23505') return respuesta.status(409).json({ error: 'Ese número de CI ya está registrado.' });
+    if (error.status) return respuesta.status(error.status).json({ error: error.message });
+    console.error('Error al procesar los datos del CI:', error.original?.code ?? error.name);
+    return respuesta.status(500).json({ error: 'No se pudieron procesar los datos del CI.' });
   }
 };
 
@@ -249,7 +345,6 @@ const obtenerTodosConductores = async (solicitud, respuesta) => {
             address: identidad.address,
             occupation: identidad.occupation,
             maritalStatus: identidad.maritalStatus,
-            bloodType: identidad.bloodType,
             verificationStatus: identidad.verificationStatus
           } : null,
           domicile: domicilio ? {
@@ -383,8 +478,16 @@ const obtenerPendienteConductorSolicitudes = async (solicitud, respuesta) => {
 
 const obtenerTodosViajes = async (solicitud, respuesta) => {
   try {
-    const { status: estado, startDate: inicioFecha, endDate: finFecha, limit: limite = 20, offset: desplazamiento = 0 } = solicitud.query;
+    const { status: estado, startDate: inicioFecha, endDate: finFecha, passengerId, driverId,
+      limit: limite = 20, offset: desplazamiento = 0 } = solicitud.query;
     const condicionesClausula = {};
+    for (const [campo, id] of Object.entries({ passengerId, driverId })) {
+      if (id === undefined) continue;
+      if (typeof id !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id)) {
+        return respuesta.status(400).json({ error: 'Identificador de participante inválido.' });
+      }
+      condicionesClausula[campo] = id;
+    }
 
     if (estado) {
       condicionesClausula.status = estado;
@@ -401,6 +504,7 @@ const obtenerTodosViajes = async (solicitud, respuesta) => {
     }
 
     const viajes = await Viaje.findAll({
+      attributes: { exclude: ['rutaRecorrida'] },
       where: condicionesClausula,
       include: [
       {
@@ -426,7 +530,7 @@ const obtenerTodosViajes = async (solicitud, respuesta) => {
 
       limit: parseInt(limite),
       offset: parseInt(desplazamiento),
-      order: [['createdAt', 'DESC']]
+      order: [['createdAt', 'DESC'], ['id', 'DESC']]
     });
 
     const total = await Viaje.count({ where: condicionesClausula });
@@ -464,6 +568,92 @@ const obtenerTodosViajes = async (solicitud, respuesta) => {
     });
   }
 };
+
+const consultarViajeAdministrativo = consultar => async (solicitud, respuesta) => {
+  const { rideId } = solicitud.params;
+  if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(rideId)) {
+    return respuesta.status(400).json({ error: 'Identificador de viaje inválido.' });
+  }
+  try {
+    const administrador = await Usuario.findOne({
+      attributes: ['id'], where: { id: solicitud.user.id, role: 'administrador', isActive: true }
+    });
+    if (!administrador) return respuesta.status(403).json({ error: 'Se requiere una cuenta de administrador activa.' });
+
+    const datos = await consultar(rideId);
+    if (!datos) return respuesta.status(404).json({ error: 'Viaje no encontrado.' });
+    return respuesta.set('Cache-Control', 'private, no-store').json(datos);
+  } catch (error) {
+    console.error('Error al consultar el detalle administrativo del viaje:', error.original?.code ?? error.name);
+    return respuesta.status(500).json({ error: 'No se pudieron cargar los datos del viaje.' });
+  }
+};
+
+const atributosRecorrido = ['status', 'pickupLocation', 'dropoffLocation', 'rutaRecorrida'];
+
+const coordenadasDelPunto = punto => {
+  if (!punto?.coordinates) return null;
+  const [longitude, latitude] = punto.coordinates;
+  return { latitude, longitude };
+};
+
+const presentarRecorrido = viaje => ({
+  status: viaje.status,
+  pickupLocation: coordenadasDelPunto(viaje.pickupLocation),
+  dropoffLocation: coordenadasDelPunto(viaje.dropoffLocation),
+  rutaRecorrida: viaje.rutaRecorrida
+    ? { type: viaje.rutaRecorrida.type, coordinates: viaje.rutaRecorrida.coordinates }
+    : null
+});
+
+const obtenerRecorridoViaje = consultarViajeAdministrativo(async rideId => {
+  const viaje = await Viaje.findByPk(rideId, { attributes: atributosRecorrido });
+  return viaje && presentarRecorrido(viaje);
+});
+
+const obtenerDetalleViaje = consultarViajeAdministrativo(async rideId => {
+  const participante = as => ({
+    model: Usuario, as, attributes: ['id', 'phone'],
+    include: [{ model: UsuarioIdentidad, as: 'identity', attributes: ['firstNames', 'paternalSurname', 'maternalSurname'] }]
+  });
+  const atributosDetalle = [
+    'id', 'driverId', 'pickup_address', 'dropoff_address', 'distance', 'duration', 'requestMode', 'vehicle_type_requested',
+    'paymentMethod', 'baseFare', 'farePerKm', 'farePerMinute', 'totalFare', 'finalFare',
+    'createdAt', 'acceptedAt', 'arrivedAt', 'passengerReadyAt', 'startedAt', 'completedAt', 'cancelledAt', 'cancelledBy'
+  ];
+  const viaje = await Viaje.findByPk(rideId, {
+    attributes: [...atributosRecorrido, ...atributosDetalle],
+    include: [
+      participante('passenger'),
+      { model: Conductor, as: 'driver', attributes: ['id'], include: [participante('user')] },
+      { model: CancelacionMotivo, as: 'cancellationReason', attributes: ['description'] },
+      { model: ServicioZona, as: 'serviceArea', attributes: ['name'] },
+      { model: Pago, as: 'payment', attributes: ['amount', 'currency', 'payment_status', 'paid_at'] },
+      { model: ViajeParada, as: 'waypoints', separate: true,
+        attributes: ['id', 'sequence', 'address', 'arrived_at', 'departed_at'], order: [['sequence', 'ASC']] }
+    ]
+  });
+  if (!viaje) return null;
+
+  const presentarParticipante = usuario => usuario ? {
+    name: [usuario.identity?.firstNames, usuario.identity?.paternalSurname, usuario.identity?.maternalSurname]
+      .filter(Boolean).join(' '),
+    phone: usuario.phone
+  } : null;
+  const pago = viaje.payment;
+  return {
+    ...Object.fromEntries(atributosDetalle.map(campo => [campo, viaje[campo]])),
+    ...presentarRecorrido(viaje),
+    passenger: presentarParticipante(viaje.passenger),
+    driver: presentarParticipante(viaje.driver?.user),
+    cancellationReason: viaje.cancellationReason?.description ?? null,
+    serviceArea: viaje.serviceArea?.name ?? null,
+    payment: pago ? { amount: pago.amount, currency: pago.currency, payment_status: pago.payment_status, paid_at: pago.paid_at } : null,
+    waypoints: viaje.waypoints.map(parada => ({
+      sequence: parada.sequence, address: parada.address, arrived_at: parada.arrived_at, departed_at: parada.departed_at
+    }))
+  };
+});
 
 const obtenerAnalitica = async (solicitud, respuesta) => {
   try {
@@ -557,7 +747,13 @@ const eliminarConductor = async (solicitud, respuesta) => {
 const obtenerDetalleUsuario = async (solicitud, respuesta) => {
   try {
     const { userId: usuarioId } = solicitud.params;
-    const usuario = await Usuario.findByPk(usuarioId, { attributes: ['id'] });
+    if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(usuarioId)) {
+      return respuesta.status(400).json({ error: 'Identificador de usuario inválido.' });
+    }
+    const usuario = await Usuario.findByPk(usuarioId, {
+      attributes: ['id', 'email', 'phone', 'role', 'createdAt', 'profilePhoto', 'isActive', 'phoneVerified'],
+      include: [{ model: UsuarioIdentidad, as: 'identity', attributes: ['firstNames', 'paternalSurname', 'maternalSurname', 'verificationStatus'] }]
+    });
     if (!usuario) return respuesta.status(404).json({ error: 'Usuario no encontrado.' });
 
     const [solicitudConductor, registros] = await Promise.all([
@@ -575,7 +771,20 @@ const obtenerDetalleUsuario = async (solicitud, respuesta) => {
       })
     ]);
 
-    return respuesta.json({
+    const identidad = usuario.identity;
+    return respuesta.set('Cache-Control', 'private, no-store').json({
+      usuario: {
+        id: usuario.id,
+        nombre: [identidad?.firstNames, identidad?.paternalSurname, identidad?.maternalSurname].filter(Boolean).join(' ') || 'Sin nombre',
+        correo: usuario.email,
+        telefono: usuario.phone,
+        rol: usuario.role,
+        fechaRegistro: usuario.createdAt,
+        foto: usuario.profilePhoto,
+        activo: usuario.isActive,
+        telefonoVerificado: usuario.phoneVerified,
+        estadoIdentidad: identidad?.verificationStatus ?? null
+      },
       solicitudConductor,
       historial: registros.map(registro => {
         const identidad = registro.changedBy?.identity;
@@ -618,6 +827,7 @@ const cambiarAccesoUsuario = (activo) => async (solicitud, respuesta) => {
       return registro;
     });
     if (!usuario) return respuesta.status(404).json({ error: 'Usuario no encontrado.' });
+    if (!activo) require('../socket').desconectarCuentaDesactivada(usuario.id);
     return respuesta.json({ message: activo ? 'Usuario habilitado.' : 'Usuario desactivado.' });
   } catch (error) {
     console.error('Error al actualizar el acceso del usuario:', error);
@@ -675,7 +885,7 @@ const alternarSuspenderConductor = async (solicitud, respuesta) => {
     const { notificar: notificar } = require("../services/notificacionServicio");
     notificar({
       userId: conductor.userId,
-      title: suspender ? '🔴 Cuenta suspendida' : '✅ Cuenta reactivada',
+      title: suspender ? 'Cuenta suspendida' : 'Cuenta reactivada',
       body: suspender ?
       'Tu cuenta ha sido suspendida temporalmente. Contacta soporte para más información.' :
       'Tu cuenta ha sido reactivada. Ya puedes recibir viajes.',
@@ -971,6 +1181,8 @@ const obtenerSuperiorRutas = async (solicitud, respuesta) => {
 };
 
 module.exports = {
+  obtenerDatosIdentidad: consultarDatosIdentidad(false),
+  corregirDatosIdentidad: consultarDatosIdentidad(true),
   obtenerIdentidadEvidencia: obtenerIdentidadEvidencia,
   obtenerConductorOcrVistaPrevia: obtenerConductorOcrVistaPrevia,
   obtenerTodosUsuarios: obtenerTodosUsuarios,
@@ -980,6 +1192,8 @@ module.exports = {
   rechazarConductor: rechazarConductor,
   obtenerPendienteConductorSolicitudes: obtenerPendienteConductorSolicitudes,
   obtenerTodosViajes: obtenerTodosViajes,
+  obtenerRecorridoViaje,
+  obtenerDetalleViaje,
   obtenerTodosPagos: obtenerTodosPagos,
   obtenerAnalitica: obtenerAnalitica,
   obtenerAnaliticaExtendido: obtenerAnaliticaExtendido,

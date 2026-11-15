@@ -65,17 +65,26 @@ async function conduccionRuta(puntos) {
   }
 }
 
-async function conduccionRutaPolilinea(puntos) {
+async function conduccionRutaDetalle(puntos) {
   const cacheClave = puntos.map((punto) => `${punto.latitude},${punto.longitude}`).join('|');
   const cacheado = geometriaCache.get(cacheClave);
-  if (cacheado && cacheado.expiresAt > Date.now()) return cacheado.polyline;
+  if (cacheado && cacheado.expiresAt > Date.now()) return cacheado.detalle;
   const ruta = await consultarConduccionRuta(puntos);
   const polilinea = ruta.overview_polyline?.points;
   if (typeof polilinea !== 'string' || !polilinea || ruta.legs.length !== puntos.length - 1)
   throw fallar(503, 'No se pudo trazar el recorrido por carretera.', 'ROUTING_UNAVAILABLE');
-  geometriaCache.set(cacheClave, { polyline: polilinea, expiresAt: Date.now() + 60 * 60 * 1000 });
+  const duraciones = ruta.legs.map(tramo => tramo.duration?.value);
+  const duration = duraciones.every(segundos => Number.isFinite(segundos) && segundos >= 0)
+    ? duraciones.reduce((total, segundos) => total + segundos, 0)
+    : null;
+  const detalle = { polyline: polilinea, duration };
+  geometriaCache.set(cacheClave, { detalle, expiresAt: Date.now() + 60 * 60 * 1000 });
   if (geometriaCache.size > 500) geometriaCache.delete(geometriaCache.keys().next().value);
-  return polilinea;
+  return detalle;
 }
 
-module.exports = { conduccionRuta: conduccionRuta, conduccionRutaPolilinea: conduccionRutaPolilinea };
+async function conduccionRutaPolilinea(puntos) {
+  return (await conduccionRutaDetalle(puntos)).polyline;
+}
+
+module.exports = { conduccionRuta, conduccionRutaDetalle, conduccionRutaPolilinea };

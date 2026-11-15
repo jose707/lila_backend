@@ -4,6 +4,7 @@ const db = require('../config/baseDatos');
 const repo = require('./documentosRepositorio');
 const tipos = require('../config/documentos-estructura');
 const { compararLicenciaLados, emisionLicenciaFutura } = require('./licenseValidacion');
+const { camposOcrPendientes } = require('./solicitudDocumentos');
 
 const etiquetas = {
   fullName:'Nombre completo', ciNumber:'CI', licenseNumber:'Número de licencia', issueDate:'Fecha de emisión',
@@ -32,6 +33,20 @@ const fechaIso = valor => {
 const nombre = valor => String(valor || '').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase()
   .replace(/[^A-Z ]/g,' ').split(/\s+/).filter(Boolean).sort().join(' ');
 const vigente = valor => !!valor && new Date(`${fechaIso(valor)}T23:59:59.999Z`) >= new Date();
+
+function validarCamposOcr(metadata, documentos) {
+  const pendientes = camposOcrPendientes(metadata.ocr || {});
+  const nombres = {
+    licenseFront: 'Licencia', licenseBack: 'Licencia (reverso)', ticPhoto: 'TIC',
+    antecedentsPhoto: 'Antecedentes', ruatPhoto: 'RUAT', soatPhoto: 'SOAT', domicileProof: 'Factura de luz'
+  };
+  return documentos.flatMap(documento => {
+    const faltantes = pendientes[documento] || [];
+    if (!faltantes.length) return [];
+    const campos = faltantes.map(clave => etiquetas[clave] || clave);
+    return [{ documento, mensaje: `${nombres[documento]}: faltan campos obligatorios del OCR (${campos.join(', ')}).` }];
+  });
+}
 
 // Las mismas reglas se usan al corregir y al aprobar; corregir no las omite.
 function validarDatosDocumentales(metadata, identidad) {
@@ -143,4 +158,4 @@ async function corregirDatos(requestId,tipo,body,administrador) {
   });
 }
 
-module.exports = { consultarDatos, corregirDatos, validarDatosDocumentales };
+module.exports = { consultarDatos, corregirDatos, validarDatosDocumentales, validarCamposOcr };

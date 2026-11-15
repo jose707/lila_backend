@@ -169,11 +169,14 @@ function buscarFechasConPositions(texto) {
   const meses = {
     ENERO: 1, FEBRERO: 2, MARZO: 3, ABRIL: 4, MAYO: 5, JUNIO: 6,
     JULIO: 7, AGOSTO: 8, SEPTIEMBRE: 9, SETIEMBRE: 9, OCTUBRE: 10,
-    NOVIEMBRE: 11, DICIEMBRE: 12
+    NOVIEMBRE: 11, DICIEMBRE: 12,
+    ENE: 1, FEB: 2, MAR: 3, ABR: 4, MAY: 5, JUN: 6, JUL: 7, AGO: 8,
+    SEP: 9, SEPT: 9, SET: 9, OCT: 10, NOV: 11, DIC: 12
   };
-  const written = /\b(\d{1,2})[\s.,:;]+(?:DE\s+)?(ENERO|FEBRERO|MARZO|ABRIL|MAYO|JUNIO|JULIO|AGOSTO|SEPTIEMBRE|SETIEMBRE|OCTUBRE|NOVIEMBRE|DICIEMBRE)[\s.,:;]+(?:(?:DE|DEL)\s+)?((?:19|20)\d{2})\b/g;
+  const written = /\b(\d{1,2})[\s/.,:;-]+(?:DE\s+)?([A-Z]+)[\s/.,:;-]+(?:(?:DE|DEL)\s+)?((?:19|20)\d{2})\b/g;
   const normalizado = stripAccents(texto || '');
   while (m = written.exec(normalizado)) {
+    if (!Object.hasOwn(meses, m[2])) continue;
     const valor = `${m[1].padStart(2, '0')}/${String(meses[m[2]]).padStart(2, '0')}/${m[3]}`;
     if (require("./identidadValidacion").isoFecha(valor)) encontrado.push({ value: valor, pos: m.index });
   }
@@ -727,21 +730,6 @@ function ciDetalleValor(texto, palabrasClave, permitirNumbers = false) {
 
 /** Extrae los datos complementarios impresos en ambos lados de la cédula. */
 function analizarCiAdditionalCampos(texto) {
-  const sangreBruto = valorDespuesKeyword(texto, [
-  'GRUPO SANGUINEO',
-  'GRUPO SANG',
-  'TIPO DE SANGRE',
-  'GRUPO']
-  );
-  const sangreCoincidencia = sangreBruto.match(
-    /\b(AB|A|B|O)\s*(?:RH\s*)?([+-]|POSITIVO|NEGATIVO)(?![A-Z])/i
-  );
-  const sangreSigno = sangreCoincidencia ?
-  /^(POSITIVO|\+)$/i.test(sangreCoincidencia[2]) ?
-  '+' :
-  '-' :
-  '';
-
   return {
     issueDate: fechaCercanoKeyword(texto, ['FECHA DE EMISION', 'FECHA EMISION', 'EMISION', 'EMITIDA EL', 'EMITIDO EL']),
     expiryDate: fechaCercanoKeyword(texto, [
@@ -764,8 +752,7 @@ function analizarCiAdditionalCampos(texto) {
     ),
     address: ciDetalleValor(texto, ['DOMICILIO', 'DOMIC', 'DOM', 'DIRECCION'], true),
     occupation: etiquetadoValor(texto, ['PROFESION/OCUPACION', 'PROFESION / OCUPACION', 'PROFESION', 'OCUPACION']),
-    maritalStatus: etiquetadoValor(texto, ['ESTADO CIVIL', 'ESTADO CIVAL']),
-    bloodType: sangreCoincidencia ? `${sangreCoincidencia[1].toUpperCase()}${sangreSigno}` : ''
+    maritalStatus: etiquetadoValor(texto, ['ESTADO CIVIL', 'ESTADO CIVAL'])
   };
 }
 
@@ -1294,7 +1281,6 @@ function analizarCi(texto, opciones) {
       resultado.maritalStatus = civilCandidatos.find((estado) =>
       /^(?:SOLTER[AO]|CASAD[AO]|DIVORCIAD[AO]|VIUD[AO]|CONCUBIN[AO]|SEPARAD[AO]|CONVIVIENTE|UNION LIBRE)$/.test(estado)) ||
       civilCandidatos[0] || '';
-      resultado.bloodType = detalles.bloodType;
       const numero = /\bN\s?(?:[o°º]|RO)\.?\s*:?\s*(\d{6,9})(?!\d)/i.exec(readableTexto);
       resultado.ciNumber = espacial.ciNumber || (numero ? numero[1] : '');
       return resultado;
@@ -1520,7 +1506,7 @@ function validarCi(texto, rostrosEncontrado, lado) {
 
 // ─── Parser: Licencia de conducir ────────────────────────────────────────────
 const LICENCIA_FECHAS_ESPACIALES = [
-  { key: 'issueDate', labels: ['EMISION', 'EMISI0N', 'EMIS ION'], type: 'date', extract: true },
+  { key: 'issueDate', labels: ['EMISION', 'EMISI0N', 'EMIS ION', 'EMIS I0N'], type: 'date', extract: true },
   { key: 'licenseExpiryDate', labels: ['VENCIMIENTO'], type: 'date', extract: true },
   { key: 'birthDate', labels: ['FECHA DE NACIMIENTO', 'NACIMIENTO'], type: 'date', extract: true }
 ];
@@ -1532,22 +1518,32 @@ function emisionLicenciaEnColumna(filas) {
     const emision = etiquetas.find(({ def }) => def.key === 'issueDate');
     if (!emision) continue;
 
-    const debajo = filas[indice + 1];
-    if (debajo.y0 - fila.y1 > 2 * fila.h ||
-    buscarEtiquetaOccurrences(debajo, LICENCIA_FECHAS_ESPACIALES).length) continue;
-
     const izquierda = fila.words[emision.start].x;
     const siguiente = etiquetas.find(({ start }) => start > emision.end);
     const derecha = siguiente ? fila.words[siguiente.start].x - fila.h / 2 :
       fila.words[emision.end].x + fila.words[emision.end].w + 4 * fila.h;
-    const columna = debajo.words.filter(({ x }) => x >= izquierda - fila.h && x < derecha);
-    if (!columna.length || Math.abs(columna[0].x - izquierda) > fila.h) continue;
-    const texto = columna.map(({ text }) => text).join(' ').replace(/\s*([/.-])\s*/g, '$1');
-    const fechas = buscarFechas(texto);
-    if (fechas.length === 1) return fechas[0];
+    const fragmentos = [];
+    for (const debajo of filas.slice(indice + 1)) {
+      if (debajo.y0 - fila.y1 > 3 * fila.h) break;
+      const etiquetasDebajo = buscarEtiquetaOccurrences(debajo, LICENCIA_FECHAS_ESPACIALES);
+      if (etiquetasDebajo.some(({ start }) => Math.abs(debajo.words[start].x - izquierda) <= fila.h)) break;
+      const otraColumna = etiquetasDebajo.find(({ start }) => debajo.words[start].x > izquierda + fila.h);
+      const limite = otraColumna ? Math.min(derecha, debajo.words[otraColumna.start].x) : derecha;
+      const columna = debajo.words.filter(({ x }) => x >= izquierda - fila.h && x < limite);
+      if (!columna.length) continue;
+      if (!fragmentos.length && Math.abs(columna[0].x - izquierda) > fila.h) continue;
+      fragmentos.push(columna.map(({ text }) => text).join(' '));
+      const fechas = buscarFechas(fragmentos.join(' ').replace(/\s*([/.-])\s*/g, '$1'));
+      if (fechas.length === 1) return fechas[0];
+      if (fechas.length > 1) break;
+    }
   }
   return '';
 }
+
+const etiquetaTelefonoEmergenciaLicencia = /\bTELEFONO\s+DE\s+EMERGENCIA\b/;
+const esReversoLicenciaModerna = texto => etiquetaTelefonoEmergenciaLicencia.test(normalizar(texto)) ||
+  /\bLENTES\s*:/.test(stripAccents(texto)) && /\bAUDIFONOS\s*:/.test(stripAccents(texto));
 
 function analizarLicencia(texto, opciones) {
   const lineas = normalizarLineas(texto);
@@ -1560,6 +1556,10 @@ function analizarLicencia(texto, opciones) {
     birthDate: '',
     licenseCategory: ''
   };
+  const { inspectMrz } = require('./ciMrz');
+  const mrz = opciones?.documentType === 'licenseFront' ? null : inspectMrz(texto);
+  const reversoModerno = esReversoLicenciaModerna(texto);
+  const contieneMrz = mrz && mrz.status !== 'unavailable';
 
   // No usar solamente `valueAfterKeyword('LICENCIA')`: suele encontrar antes
   // el título "LICENCIA DE CONDUCIR" que la línea del número.
@@ -1575,7 +1575,22 @@ function analizarLicencia(texto, opciones) {
       break;
     }
   }
-  if (!resultado.licenseNumber) {
+  if (contieneMrz || (opciones?.documentType === 'licenseBack' && reversoModerno &&
+      etiquetaTelefonoEmergenciaLicencia.test(normalizar(texto)) && !resultado.licenseNumber)) {
+    resultado.licenseNumber = reversoModerno && mrz?.status === 'valid' && /^\d{6,9}$/.test(mrz.documentNumber)
+      ? mrz.documentNumber : '';
+    if (resultado.licenseNumber) {
+      const datosMrz = analizarMrz(texto);
+      resultado.fullName = datosMrz.fullName;
+      resultado.birthDate = require('./identidadValidacion').isoFecha(datosMrz.birthDate) ? datosMrz.birthDate : '';
+      const anioActual = new Date().getUTCFullYear();
+      const anioVencimiento = anioActual - (anioActual % 100) + Number(mrz.expiry.slice(0, 2));
+      const anio = anioVencimiento > anioActual + 50 ? anioVencimiento - 100 :
+        anioVencimiento < anioActual - 50 ? anioVencimiento + 100 : anioVencimiento;
+      const vencimiento = mrz.expiry.slice(4, 6) + '/' + mrz.expiry.slice(2, 4) + '/' + anio;
+      resultado.licenseExpiryDate = require('./identidadValidacion').isoFecha(vencimiento) ? vencimiento : '';
+    }
+  } else if (!resultado.licenseNumber) {
     resultado.licenseNumber = lineas.find((linea) => /^\d{6,9}$/.test(linea)) || '';
   }
 
@@ -1603,11 +1618,34 @@ function analizarLicencia(texto, opciones) {
     const licenciaApellidos = etiquetadoValor(texto, ['APELLIDOS', 'APELLIDO']);
     resultado.fullName = [licenciaNames, licenciaApellidos].filter(Boolean).join(' ').trim();
   }
+  if (!resultado.fullName && /\bLICENCIA\s+PARA\s+CONDUCIR\b/.test(lineas.join(' '))) {
+    const esTextoNombre = valor => /^[A-Z]{2,}(?: [A-Z]{2,})*$/.test(valor) &&
+      !valor.split(' ').some(palabra => ETIQUETA_PALABRA_RE.test(palabra) || /^(GENERO|SEGIP)$/.test(palabra));
+    const quitarCategoria = linea => (linea || '').split(/\s+CATEGORIA\b/)[0].trim();
+    const nombreSinComa = linea => quitarCategoria(linea).replace(/\s*,\s*/g, ' ');
+    const inicio = lineas.findIndex(linea => /\bCONDUCIR\b/.test(linea));
+    const fin = lineas.findIndex((linea, indice) => indice > inicio && /^(GENERO|SEXO|NACIONALIDAD|FECHA DE NACIMIENTO)\b/.test(linea));
+    const candidatos = lineas.slice(inicio + 1, fin < 0 ? inicio + 6 : fin);
+    let lineaNombre = candidatos.findIndex(linea => linea.includes(',') && esTextoNombre(nombreSinComa(linea)));
+    if (lineaNombre === -1) {
+      lineaNombre = candidatos.findIndex(linea => {
+        const nombre = quitarCategoria(linea);
+        return esTextoNombre(nombre) && /^[A-Z]+(?: [A-Z]+){1,4}$/.test(nombre) &&
+          nombre.split(' ').every(palabra => /[AEIOU]/.test(palabra));
+      });
+    }
+    if (lineaNombre !== -1) {
+      const nombre = nombreSinComa(candidatos[lineaNombre]);
+      const apellido = quitarCategoria(candidatos[lineaNombre + 1]);
+      resultado.fullName = esTextoNombre(apellido) ? nombre + ' ' + apellido : nombre;
+    }
+  }
   resultado.nationality = etiquetadoValor(texto, ['NACIONALIDAD']);
-  resultado.issueDate = fechaCercanoKeyword(texto, ['FECHA DE EMISION', 'FECHA EMISION', 'EMISION']);
-  resultado.birthDate = fechaCercanoKeyword(texto, ['FECHA DE NACIMIENTO', 'NACIMIENTO']);
+  const textoFechas = stripAccents(texto).replace(/\bEMIS[ \t]*I[O0]N\b/g, 'EMISION');
+  resultado.issueDate = fechaCercanoKeyword(textoFechas, ['EMISION']);
+  resultado.birthDate ||= fechaCercanoKeyword(texto, ['FECHA DE NACIMIENTO', 'NACIMIENTO']);
 
-  resultado.licenseExpiryDate =
+  resultado.licenseExpiryDate ||=
   fechaCercanoKeyword(texto, [
   'VENCIMIENTO',
   'VENCIMlENTO',
@@ -1616,19 +1654,20 @@ function analizarLicencia(texto, opciones) {
   'EXPIRACION',
   'VENCE',
   'VALIDA HASTA',
-  'HASTA']
+  ...(!reversoModerno && !contieneMrz ? ['HASTA'] : [])]
   ) || '';
 
   // Vision puede devolver «Emisión\nVencimiento\n11/10/2022 11/10/2027».
   if (!resultado.issueDate || !resultado.licenseExpiryDate || resultado.issueDate === resultado.licenseExpiryDate) {
-    const emissionIndice = lineas.findIndex((linea) => /\bEMISION\b/.test(linea));
-    const vencimientoIndice = lineas.findIndex((linea) => /\bVENCIMIENTO\b/.test(linea));
+    const lineasFechas = normalizarLineas(textoFechas);
+    const emissionIndice = lineasFechas.findIndex((linea) => /\bEMISION\b/.test(linea));
+    const vencimientoIndice = lineasFechas.findIndex((linea) => /\bVENCIMIENTO\b/.test(linea));
     if (emissionIndice !== -1 && vencimientoIndice !== -1 && Math.abs(emissionIndice - vencimientoIndice) <= 2) {
       const inicio = Math.max(emissionIndice, vencimientoIndice);
       const fechas = [];
-      for (let indice = inicio; indice <= Math.min(lineas.length - 1, inicio + 2); indice++) {
-        if (indice > inicio && SIGUIENTE_LINEA_ETIQUETA_RE.test(lineas[indice])) break;
-        fechas.push(...buscarFechas(lineas[indice]));
+      for (let indice = inicio; indice <= Math.min(lineasFechas.length - 1, inicio + 2); indice++) {
+        if (indice > inicio && SIGUIENTE_LINEA_ETIQUETA_RE.test(lineasFechas[indice])) break;
+        fechas.push(...buscarFechas(lineasFechas[indice]));
       }
       if (fechas.length === 2 && emissionIndice < vencimientoIndice) {
         resultado.issueDate = fechas[0];
@@ -1651,9 +1690,7 @@ function analizarLicencia(texto, opciones) {
   }
 
   // Categoría: CATEGORIA: P / CAT. P-C / CLASE P
-  const reCat = /CATEGORI[A]?\s*[.:]?\s*([A-Z](?:\s*[.\-–]\s*[A-Z])?)/;
-  const reClase = /CLASE\s*[.:]?\s*([A-Z](?:\s*[.\-–]\s*[A-Z])?)/;
-  const mc = texto.match(reCat) || texto.match(reClase);
+  const mc = /\b(?:CATEGORIA|CAT|CLASE)[ .:]*([A-Z](?:\s*[.\-–]\s*[A-Z])?)\b/.exec(stripAccents(texto));
   if (mc) {
     resultado.licenseCategory = mc[1].replace(/\s+/g, '');
   } else {
@@ -2392,7 +2429,7 @@ const REQUERIDOS_POR_TIPO = {
   ticPhoto: ['ticNumber', 'fullName', 'licenseNumber'],
   soatPhoto: ['soatRosetteNumber', 'soatYear', 'soatPlate', 'soatStartDate', 'soatExpiryDate'],
   ruatPhoto: ['vehiclePlate', 'vehicleBrand', 'vehicleModel', 'vehicleYear', 'vehicleColor', 'vehicleOwnerName', 'vehicleOwnerCi'],
-  antecedentsPhoto: ['fullName', 'ciNumber', 'backgroundResult', 'issueDate', 'validUntil'],
+  antecedentsPhoto: ['fullName', 'ciNumber', 'birthDate', 'backgroundUnit', 'backgroundResult', 'issueDate', 'validUntil'],
   domicileProof: ['serviceAddress', 'billingMonth'],
   profilePhoto: [],
   carFront: [],
@@ -2404,6 +2441,13 @@ const REQUERIDO_ANTIGUO_CI = {
   ciFront: ['ciNumber', 'issueDate', 'expiryDate'],
   ciBack: ['firstNames', 'surnames', 'birthDate', 'birthPlace', 'address', 'occupation', 'maritalStatus']
 };
+
+function camposRequeridosDocumento(tipo, texto) {
+  if (tipo === 'licenseBack' && esReversoLicenciaModerna(texto) &&
+      (etiquetaTelefonoEmergenciaLicencia.test(normalizar(texto)) ||
+       require('./ciMrz').normalizarMrzLineas(texto).index >= 0)) return ['licenseNumber'];
+  return REQUERIDOS_POR_TIPO[tipo] || [];
+}
 
 /**
  * Extrae y parsea el texto de una imagen según su tipo de documento.
@@ -2435,7 +2479,7 @@ async function extraerDocumento(buffer, documentoTipo) {
 
   const requerido = campos.format === 'legacy' ?
   REQUERIDO_ANTIGUO_CI[documentoTipo] || [] :
-  REQUERIDOS_POR_TIPO[documentoTipo] || [];
+  camposRequeridosDocumento(documentoTipo, brutoTexto);
   const faltante = requerido.filter(
     (clave) => !campos[clave] || !String(campos[clave]).trim()
   );
@@ -2444,6 +2488,7 @@ async function extraerDocumento(buffer, documentoTipo) {
 }
 
 module.exports = {
+  camposRequeridosDocumento,
   extraerDocumento: extraerDocumento,
   extraerTextoDesdeBuffer: extraerTextoDesdeBuffer,
   anotarImagenBuffer: anotarImagenBuffer,

@@ -4,11 +4,19 @@ const enrutador = express.Router();
 const administradorControlador = require("../controllers/adminControlador");
 const conductorRevisionControlador = require("../controllers/conductorRevisionControlador");
 const { autenticacionIntermediario: autenticacionIntermediario, adminIntermediario: administradorIntermediario } = require("../middleware/autenticacion");
+enrutador.get('/usuarios/:userId/datos-identidad', autenticacionIntermediario, administradorIntermediario, administradorControlador.obtenerDatosIdentidad);
+enrutador.put('/usuarios/:userId/datos-identidad', autenticacionIntermediario, administradorIntermediario, administradorControlador.corregirDatosIdentidad);
 enrutador.get('/solicitudes/:requestId/documentos/:tipo/datos', autenticacionIntermediario, administradorIntermediario, conductorRevisionControlador.datosDocumento);
 enrutador.put('/solicitudes/:requestId/documentos/:tipo/datos', autenticacionIntermediario, administradorIntermediario, conductorRevisionControlador.corregirDocumento);
 
 const conductoresGestion = require('../controllers/conductoresGestionControlador');
+const notificacionesAdmin = require('../controllers/notificacionesAdminControlador');
 const { listarEmergencias, resolverEmergencia, obtenerDireccionEmergencia } = require('../controllers/emergenciaViajeControlador');
+
+enrutador.get('/notificaciones/destinatarios', autenticacionIntermediario, administradorIntermediario, notificacionesAdmin.buscarDestinatarios);
+enrutador.get('/notificaciones', autenticacionIntermediario, administradorIntermediario, notificacionesAdmin.historial);
+enrutador.post('/notificaciones/vista-previa', autenticacionIntermediario, administradorIntermediario, notificacionesAdmin.vistaPrevia);
+enrutador.post('/notificaciones', autenticacionIntermediario, administradorIntermediario, notificacionesAdmin.enviar);
 
 enrutador.get('/emergencias', autenticacionIntermediario, administradorIntermediario, listarEmergencias);
 enrutador.get('/emergencias/:id/direccion', autenticacionIntermediario, administradorIntermediario, obtenerDireccionEmergencia);
@@ -108,6 +116,8 @@ enrutador.get(
   administradorIntermediario,
   administradorControlador.obtenerTodosViajes
 );
+enrutador.get('/viajes/:rideId/recorrido', autenticacionIntermediario, administradorIntermediario, administradorControlador.obtenerRecorridoViaje);
+enrutador.get('/viajes/:rideId', autenticacionIntermediario, administradorIntermediario, administradorControlador.obtenerDetalleViaje);
 enrutador.get(
   '/analitica',
   autenticacionIntermediario,
@@ -264,4 +274,5 @@ enrutador.put('/documentos/:documentId/revisar',autenticacionIntermediario,admin
 
 const comisionesZona=require('../controllers/comisionZonaControlador');
 enrutador.get('/zonas-servicio',autenticacionIntermediario,administradorIntermediario,comisionesZona.listar);
+enrutador.put('/zonas-servicio/:zoneId',autenticacionIntermediario,administradorIntermediario,comisionesZona.actualizar);
 enrutador.put('/zonas-servicio/:zoneId/tasa-comision',autenticacionIntermediario,administradorIntermediario,comisionesZona.actualizar);

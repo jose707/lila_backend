@@ -346,7 +346,6 @@ CREATE UNIQUE INDEX documento_antecedentes_pkey ON public.documento_antecedentes
 | direccion | character varying(255) | Sí |  |
 | ocupacion | character varying(150) | Sí |  |
 | estado_civil | character varying(50) | Sí |  |
-| grupo_sanguineo | character varying(5) | Sí |  |
 | creado_en | timestamp with time zone | No | now() |
 | actualizado_en | timestamp with time zone | No | now() |
 
@@ -647,7 +646,6 @@ La lectura se determina únicamente por leido_en: NULL significa no leída y una
 | id_solicitud_conductor | uuid | Sí |  |
 | id_alerta_emergencia | uuid | Sí |  |
 | id_comision | uuid | Sí |  |
-| enviado_en | timestamp with time zone | Sí |  |
 | leido_en | timestamp with time zone | Sí |  |
 | creado_en | timestamp with time zone | No | now() |
 

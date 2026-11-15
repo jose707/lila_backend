@@ -2,6 +2,19 @@
 const repo = require('./documentosRepositorio');
 const types = require('../config/documentos-estructura');
 const db = require('../config/baseDatos');
+const { resolverEmisionLicencia } = require('./licenseValidacion');
+
+function camposOcrPendientes(ocr) {
+  const { camposRequeridosDocumento } = require('./servicioOcr');
+  return Object.fromEntries(Object.keys(types).map(tipo => {
+    const campos = ocr[tipo]?.fields || {};
+    const faltantes = camposRequeridosDocumento(tipo, ocr[tipo]?.text).filter(clave => !String(campos[clave] ?? '').trim());
+    if (tipo === 'licenseFront' && resolverEmisionLicencia(campos, ocr.licenseBack?.fields)) {
+      return [tipo, faltantes.filter(clave => clave !== 'issueDate')];
+    }
+    return [tipo, faltantes];
+  }));
+}
 async function readMetadata(id, t) {
   const rows = await repo.select('SELECT d.* FROM public.solicitud_documento sd JOIN public.documento d USING(id_documento) WHERE sd.id_solicitud_conductor=:id', {
     id
@@ -20,7 +33,8 @@ async function readMetadata(id, t) {
     const fields = Object.fromEntries(Object.entries(spec.fields).filter(([, col]) => detail?.[col] != null).map(([key, col]) => [key, detail[col]]));
     if (type === 'ticPhoto') fields.fullName = [fields.firstNames, fields.surnames]
       .map(value => String(value || '').trim()).filter(Boolean).join(' ');
-    const missing = (require('./servicioOcr').REQUERIDOS_POR_TIPO[type] || []).filter(key => !String(fields[key] ?? '').trim());
+    const missing = require('./servicioOcr').camposRequeridosDocumento(type, row.texto_ocr)
+      .filter(key => !String(fields[key] ?? '').trim());
     ocr[type] = {
       fields,
       text: row.texto_ocr || '',
@@ -39,6 +53,7 @@ async function readMetadata(id, t) {
       licenseCategory: license.licenseCategory,
       licenseIssueDate: license.issueDate,
       licenseNationality: license.nationality,
+      ocrCamposPendientes: camposOcrPendientes(ocr),
       ocr
     },
     rejected
@@ -115,6 +130,7 @@ function configure(model) {
   };
 }
 module.exports = {
+  camposOcrPendientes,
   readMetadata,
   saveMetadata,
   configure

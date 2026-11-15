@@ -54,7 +54,7 @@ test('traza la ruta del pasajero con las paradas en orden', async () => {
   const res = respuesta();
   await obtenerViajeRuta({ params: { rideId: 'ride-1' }, user: { id: 'pasajero' } }, res);
   comprobar.equal(res.code, 200);
-  comprobar.deepEqual(res.body, { polyline: 'encoded-road-route' });
+  comprobar.deepEqual(res.body, { polyline: 'encoded-road-route', duration: null });
 });
 
 test('rechaza el acceso de usuarios ajenos al viaje', async () => {
@@ -73,7 +73,29 @@ test('permite al conductor asignado consultar el mismo recorrido', async () => {
   const res = respuesta();
   await obtenerViajeRuta({ params: { rideId: 'ride-1' }, user: { id: 'driver-user' } }, res);
   comprobar.equal(res.code, 200);
-  comprobar.deepEqual(res.body, { polyline: 'encoded-road-route' });
+  comprobar.deepEqual(res.body, { polyline: 'encoded-road-route', duration: null });
+});
+
+test('estima la recogida desde el GPS del conductor hasta el pasajero', async () => {
+  Viaje.findByPk = async () => ({
+    passengerId: 'pasajero', driverId: 'driver-record', status: 'aceptado',
+    pickupLocation: { coordinates: [-68.18, -16.58] },
+    dropoffLocation: { coordinates: [-68.20, -16.60] }
+  });
+  ConductorUbicacion.findByPk = async () => ({
+    location: { coordinates: [-68.16, -16.56] }, location_recorded_at: new Date()
+  });
+  global.fetch = async (url) => {
+    const params = new URL(url).searchParams;
+    comprobar.equal(params.get('origin'), '-16.56,-68.16');
+    comprobar.equal(params.get('destination'), '-16.58,-68.18');
+    return { ok: true, json: async () => ({ status: 'OK', routes: [
+      { legs: [{ duration: { value: 240 } }], overview_polyline: { points: 'recogida' } }
+    ] }) };
+  };
+  const res = respuesta();
+  await obtenerViajeRuta({ params: { rideId: 'ride-1' }, query: { recogida: '1' }, user: { id: 'pasajero' } }, res);
+  comprobar.deepEqual(res.body, { polyline: 'recogida', duration: 240 });
 });
 
 test('recalcula desde el GPS reciente y omite paradas visitadas', async () => {
@@ -94,13 +116,18 @@ test('recalcula desde el GPS reciente y omite paradas visitadas', async () => {
     comprobar.equal(params.get('origin'), '-16.54,-68.14');
     comprobar.equal(params.get('waypoints'), '-16.55,-68.15');
     return { ok: true, json: async () => ({ status: 'OK', routes: [
-      { legs: [{}, {}], overview_polyline: { points: 'rerouted' } }
+      { legs: [{ duration: { value: 240 } }, { duration: { value: 480 } }], overview_polyline: { points: 'rerouted' } }
     ] }) };
   };
   const res = respuesta();
   await obtenerViajeRuta({ params: { rideId: 'ride-1' }, query: { recalcular: '1' }, user: { id: 'pasajero' } }, res);
   comprobar.equal(res.code, 200);
   comprobar.equal(res.body.polyline, 'rerouted');
+  comprobar.equal(res.body.duration, 720);
+  const sinParametro = respuesta();
+  await obtenerViajeRuta({ params: { rideId: 'ride-1' }, user: { id: 'pasajero' } }, sinParametro);
+  comprobar.equal(sinParametro.code, 200);
+  comprobar.equal(sinParametro.body.polyline, 'rerouted');
 });
 
 test('rechaza recalcular con una ubicación antigua', async () => {

@@ -3,6 +3,48 @@
 const { test } = require('node:test');
 const comprobar = require('node:assert/strict');
 const { analizarLicencia: analizarLicencia, REQUERIDOS_POR_TIPO: REQUERIDOS_POR_TIPO } = require("../servicioOcr");
+const { camposRequeridosDocumento } = require('../servicioOcr');
+const { comprobarDigito } = require('../ciMrz');
+const { camposOcrPendientes } = require('../solicitudDocumentos');
+
+test('licencia reciente: lee el nombre sin rótulo y las fechas con meses abreviados', () => {
+  const texto = [
+    'LICENCIA PARA', 'CONDUCIR', 'ANA MARIA, ROJAS', 'PEREZ', 'CATEGORÍA:', 'A',
+    'GÉNERO: Femenino', 'NACIONALIDAD:', 'Boliviana', 'FECHA DE NACIMIENTO:', '06 / ago / 2000',
+    'N° 12345678', 'EMISIÓN: 02 / oct. / 2025', 'VENCIMIENTO: 24 / ene / 2030'
+  ].join('\n');
+  comprobar.deepEqual(analizarLicencia(texto, { documentType: 'licenseFront' }), {
+    licenseNumber: '12345678', fullName: 'ANA MARIA ROJAS PEREZ', nationality: 'BOLIVIANA',
+    issueDate: '02/10/2025', licenseExpiryDate: '24/01/2030', birthDate: '06/08/2000', licenseCategory: 'A'
+  });
+  comprobar.equal(analizarLicencia(texto.replace('MARIA,', 'MARIA'), { documentType: 'licenseFront' }).fullName,
+    'ANA MARIA ROJAS PEREZ');
+});
+
+test('licencia reciente: lee el número del MRZ y nunca lo toma del teléfono de emergencia', () => {
+  const numero = '12345678<';
+  const nacimiento = '000806';
+  const vencimiento = '300124';
+  const primera = ('I<BOL' + numero + comprobarDigito(numero)).padEnd(30, '<');
+  const segunda = (nacimiento + comprobarDigito(nacimiento) + 'F' + vencimiento +
+    comprobarDigito(vencimiento) + 'BOL').padEnd(29, '<');
+  const control = comprobarDigito(primera.slice(5) + segunda.slice(0, 7) + segunda.slice(8, 15) + segunda.slice(18));
+  const encabezado = 'LENTES: SI\nAUDÍFONOS: NO\nTELÉFONO DE EMERGENCIA:\n76543210\nA\nVehículo con carga de hasta 2 toneladas.';
+  const texto = [encabezado, primera, segunda + control, 'ROJAS<PEREZ<<ANA<MARIA'.padEnd(30, '<')].join('\n');
+  const campos = analizarLicencia(texto, { documentType: 'licenseBack' });
+  comprobar.equal(campos.licenseNumber, '12345678');
+  comprobar.equal(campos.birthDate, '06/08/2000');
+  comprobar.equal(campos.licenseExpiryDate, '24/01/2030');
+  comprobar.equal(campos.licenseCategory, 'A');
+  comprobar.equal(campos.issueDate, '');
+  comprobar.deepEqual(camposRequeridosDocumento('licenseBack', texto), ['licenseNumber']);
+  comprobar.deepEqual(camposOcrPendientes({ licenseBack: { text: texto, fields: campos } }).licenseBack, []);
+  for (const incompleto of [encabezado, texto.replace('12345678', '12345679')]) {
+    const fields = analizarLicencia(incompleto, { documentType: 'licenseBack' });
+    comprobar.equal(fields.licenseNumber, '');
+    comprobar.deepEqual(camposOcrPendientes({ licenseBack: { text: incompleto, fields } }).licenseBack, ['licenseNumber']);
+  }
+});
 
 test('licencia: anverso con nombre en dos líneas, fechas juntas y categoría sin etiqueta', () => {
   const campos = analizarLicencia([
@@ -87,6 +129,21 @@ test('licencia frontal reúne los fragmentos de emisión sin tomar el vencimient
   const resultado = analizarLicencia(texto, { documentType: 'licenseFront', words });
   comprobar.equal(resultado.issueDate, '11/10/2022');
   comprobar.equal(resultado.licenseExpiryDate, '11/10/2027');
+});
+
+test('licencia reciente: recupera la emisión partida cerca de una etiqueta desplazada de vencimiento', () => {
+  const words = [
+    { text: 'EMISIÓN', x: 130, y: 20, w: 55, h: 12 },
+    { text: '02 / oct /', x: 130, y: 36, w: 60, h: 12 },
+    { text: 'VENCIMIENTO', x: 250, y: 36, w: 95, h: 12 },
+    { text: '2025', x: 194, y: 50, w: 35, h: 12 },
+    { text: '24 / ene / 2030', x: 250, y: 50, w: 95, h: 12 }
+  ];
+  const texto = 'EMISIÓN:\n02 / oct /\nVENCIMIENTO:\n24 / ene / 2030\n2025';
+  const resultado = analizarLicencia(texto, { documentType: 'licenseFront', words });
+  comprobar.equal(resultado.issueDate, '02/10/2025');
+  comprobar.equal(resultado.licenseExpiryDate, '24/01/2030');
+  comprobar.equal(analizarLicencia('EMIS I0N:\n02 / oct / 2025').issueDate, '02/10/2025');
 });
 
 test('licencia: reverso con número y categoría sin etiqueta; ignora datos accesorios', () => {

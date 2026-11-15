@@ -2,6 +2,7 @@ const { obtenerConsentimientoIdentidad, validarConsentimientoIdentidad } = requi
 const documentosRepo = require('../services/documentosRepositorio');
 // backend/src/controllers/autenticacionControlador.js
 const Usuario = require("../models/Usuario");
+const { cuentaDesactivada } = require('../middleware/autenticacion');
 const UsuarioIdentidad = require("../models/UsuarioIdentidad");
 const sequelize = require("../config/baseDatos");
 const Conductor = require("../models/Conductor");
@@ -48,6 +49,7 @@ const construirUsuarioRespuestaObjeto = async (usuario) => {
   '';
   const respuestaUsuario = {
     id: usuario.id,
+    createdAt: usuario.createdAt,
     // Compatibilidad de API: se expone el nombre oficial, no se duplica en users.
     nombre: officialNombre,
     correo: usuario.email,
@@ -131,6 +133,7 @@ const comprobarFirebaseUsuario = async (solicitud, respuesta) => {
     });
 
     if (usuario) {
+      if (!usuario.isActive) return respuesta.status(403).json({ error: cuentaDesactivada.error });
       // Si el usuario fue creado con Firebase/Google pero no completó la verificación de teléfono,
       // no debemos permitir inicio de sesión.
       if (usuario.firebaseUid && !usuario.phoneVerified) {
@@ -251,10 +254,7 @@ const ingresar = async (solicitud, respuesta) => {
 
     // Verificar si el usuario está activo
     if (!usuario.isActive) {
-      return respuesta.status(403).json({
-        error:
-        'Tu cuenta ha sido deshabilitada. Contacta al administrador para más información.'
-      });
+      return respuesta.status(403).json({ error: cuentaDesactivada.error });
     }
 
     // Si este usuario está asociado a Firebase/Google, exigir verificación (teléfono/OTP)
@@ -379,10 +379,7 @@ const googleAutenticacion = async (solicitud, respuesta) => {
     } else {
       console.log('Existing user found:', usuario.id, correo);
       if (!usuario.isActive) {
-        return respuesta.status(403).json({
-          error:
-          'Tu cuenta ha sido deshabilitada. Contacta al administrador para más información.'
-        });
+        return respuesta.status(403).json({ error: cuentaDesactivada.error });
       }
     }
 
@@ -443,6 +440,9 @@ const verificarTelefonoOtp = async (solicitud, respuesta) => {
     let usuario = await Usuario.findOne({
       where: { firebaseUid }
     });
+    if (usuario && !usuario.isActive) {
+      return respuesta.status(403).json({ error: cuentaDesactivada.error });
+    }
 
     if (!usuario) {
       // Create new user from Firebase with the data sent from frontend

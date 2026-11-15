@@ -1,12 +1,13 @@
 'use strict';
 
 const db = require('../config/baseDatos');
-const { avisarCentral, enviarSmsPendientes } = require('../services/avisosEmergencia');
+const { avisarCentral, enviarWhatsAppPendientes } = require('../services/avisosEmergencia');
 const esUuid = id => /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id);
 
 async function registrarEmergenciaViaje(solicitud, respuesta) {
   const { rideId: idViaje } = solicitud.params;
   const idUsuario = solicitud.user.id;
+  const avisosWhatsAppActivos = process.env.EMERGENCY_WHATSAPP_ENABLED === 'true';
   const { latitud = null, longitud = null } = solicitud.body ?? {};
   const sinUbicacion = latitud === null && longitud === null;
   if (!sinUbicacion && (!Number.isFinite(latitud) || !Number.isFinite(longitud) ||
@@ -37,20 +38,29 @@ async function registrarEmergenciaViaje(solicitud, respuesta) {
       const [[alerta]] = await consultar(`INSERT INTO public.alerta_emergencia (id_viaje, id_usuario, ubicacion)
         VALUES (:idViaje, :idUsuario, ST_SetSRID(ST_MakePoint(:longitud, :latitud), 4326))
         RETURNING id_alerta_emergencia AS "idAlerta"`, { idViaje, idUsuario, longitud, latitud });
-      const enlace = sinUbicacion ? '' : ` Ubicación: https://maps.google.com/?q=${latitud},${longitud}`;
-      const cuerpo = `Línea Lila: tu contacto activó una alerta de emergencia durante un viaje.${enlace}`;
-      const [sms] = await consultar(`INSERT INTO public.registro_sms_emergencia (id_alerta, id_contacto, telefono_destino, cuerpo_mensaje)
+      if (!avisosWhatsAppActivos) return { codigo: 201, datos: alerta };
+      const [[identidad]] = await consultar(`SELECT NULLIF(TRIM(CONCAT_WS(' ', ci.nombres,
+        ci.apellido_paterno, ci.apellido_materno)), '') AS nombre
+        FROM public.documento_ci ci JOIN public.usuario_documento ud ON ud.id_documento = ci.id_documento_ci
+        WHERE ud.id_usuario = :idUsuario LIMIT 1`, { idUsuario });
+      const nombre = identidad?.nombre || 'Tu contacto';
+      const ubicacion = sinUbicacion ? 'Ubicación no disponible' : `https://maps.google.com/?q=${latitud},${longitud}`;
+      const cuerpo = `Linea Lila\nAtencion. ${nombre} activó una alerta de emergencia durante un viaje. ` +
+        `Ubicación al activar la alerta: ${ubicacion}. Intenta comunicarte con tu contacto.\nAviso automático de Línea Lila.`;
+      const [avisos] = await consultar(`INSERT INTO public.registro_sms_emergencia (id_alerta, id_contacto, telefono_destino, cuerpo_mensaje)
         SELECT :idAlerta, id_contacto_emergencia, telefono, :cuerpo FROM public.contacto_emergencia
         WHERE id_usuario = :idUsuario AND activo ORDER BY creado_en LIMIT 5
         RETURNING id_registro_sms_emergencia AS id, telefono_destino AS telefono, cuerpo_mensaje AS cuerpo`,
       { idAlerta: alerta.idAlerta, idUsuario, cuerpo });
-      return { codigo: 201, datos: alerta, sms };
+      return { codigo: 201, datos: alerta, avisos, nombre, ubicacion };
     });
     if (!resultado.datos.idAlerta) return respuesta.status(resultado.codigo).json(resultado.datos);
     const { idAlerta } = resultado.datos;
     if (resultado.codigo === 201) {
       void avisarCentral(idAlerta, idViaje).catch(error => console.error('Error al avisar a la central:', error.original?.code ?? error.name));
-      await enviarSmsPendientes(resultado.sms);
+      if (avisosWhatsAppActivos) {
+        await enviarWhatsAppPendientes(resultado.avisos, resultado.nombre, resultado.ubicacion);
+      }
     }
     const [[contactos]] = await db.query(`SELECT COUNT(*)::int AS total,
       COUNT(*) FILTER (WHERE estado = 'enviado')::int AS aceptados,
@@ -62,6 +72,23 @@ async function registrarEmergenciaViaje(solicitud, respuesta) {
   } catch (error) {
     console.error('Error al registrar la alerta de emergencia:', error.original?.code ?? error.name);
     return respuesta.status(500).json({ error: 'No se pudo registrar la alerta. Intenta nuevamente.' });
+  }
+}
+
+async function obtenerMiEmergencia(solicitud, respuesta) {
+  respuesta.set('Cache-Control', 'private, no-store');
+  const { rideId: idViaje } = solicitud.params;
+  if (!esUuid(idViaje)) return respuesta.status(400).json({ error: 'El identificador del viaje no es válido.' });
+  try {
+    const [[alerta]] = await db.query(`SELECT id_alerta_emergencia AS "idAlerta"
+      FROM public.alerta_emergencia WHERE id_viaje = :idViaje AND id_usuario = :idUsuario
+      AND estado = 'activo' ORDER BY activada_en DESC LIMIT 1`, {
+      esquemaFisico: true, replacements: { idViaje, idUsuario: solicitud.user.id }
+    });
+    return respuesta.json({ idAlerta: alerta?.idAlerta ?? null });
+  } catch (error) {
+    console.error('Error al consultar la alerta de emergencia:', error.original?.code ?? error.name);
+    return respuesta.status(503).json({ error: 'No se pudo consultar la alerta.' });
   }
 }
 
@@ -81,8 +108,8 @@ async function listarEmergencias(solicitud, respuesta) {
       cu.telefono AS "telefonoConductor",
       vehiculo.datos AS "vehiculoRegistrado",
       contactos.pasajero AS "contactosPasajero", contactos.conductor AS "contactosConductor",
-      sms.total AS "smsTotal", sms.enviados AS "smsEnviados", sms.fallidos AS "smsFallidos",
-      sms.total - sms.enviados - sms.fallidos AS "smsPendientes"
+      avisos.total AS "avisosTotal", avisos.enviados AS "avisosEnviados", avisos.fallidos AS "avisosFallidos",
+      avisos.total - avisos.enviados - avisos.fallidos AS "avisosPendientes"
       FROM public.alerta_emergencia a JOIN public.usuario u ON u.id_usuario = a.id_usuario
       LEFT JOIN (SELECT ci.*, ud.id_usuario FROM public.documento_ci ci JOIN public.usuario_documento ud ON ud.id_documento=ci.id_documento_ci) i ON i.id_usuario = a.id_usuario
       LEFT JOIN public.viaje v ON v.id_viaje = a.id_viaje
@@ -117,7 +144,7 @@ async function listarEmergencias(solicitud, respuesta) {
           COUNT(*) FILTER (WHERE estado = 'enviado')::int AS enviados,
           COUNT(*) FILTER (WHERE estado = 'fallido')::int AS fallidos
         FROM public.registro_sms_emergencia WHERE id_alerta = a.id_alerta_emergencia
-      ) sms ON true
+      ) avisos ON true
       WHERE a.estado = 'activo' ORDER BY a.activada_en DESC LIMIT 50`, { esquemaFisico: true });
     return respuesta.json({ alertas });
   } catch (error) {
@@ -170,4 +197,4 @@ async function resolverEmergencia(solicitud, respuesta) {
   }
 }
 
-module.exports = { registrarEmergenciaViaje, listarEmergencias, resolverEmergencia, obtenerDireccionEmergencia };
+module.exports = { registrarEmergenciaViaje, obtenerMiEmergencia, listarEmergencias, resolverEmergencia, obtenerDireccionEmergencia };

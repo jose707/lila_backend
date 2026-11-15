@@ -1,13 +1,15 @@
 const { Op } = require('sequelize');
 const db = require('../config/baseDatos');
-const { Conductor, Usuario, UsuarioIdentidad, Vehiculo, Viaje, AuditoriaRegistro } = require('../models');
+const { Conductor, ConductorUbicacion, Usuario, UsuarioIdentidad, Vehiculo, Viaje, AuditoriaRegistro } = require('../models');
 const ComisionLiquidacion = require('../models/ComisionLiquidacion');
 const { notificar } = require('../services/notificacionServicio');
 const { ultimosComprobantes } = require('./comprobantesComisionControlador');
 const { estadoLiquidacion } = require('./comisionesAdminControlador');
 const { fechaBolivia } = require('../jobs/liquidacionJobs');
+const documentos = require('../services/documentosRepositorio');
 
 const estadosOperativos = ['aprobado', 'suspendido'];
+const estadosViajeActivo = ['aceptado', 'llegado', 'en_curso'];
 const usuarioIncluido = {
   model: Usuario, as: 'user', required: true, attributes: ['id', 'email', 'phone', 'profilePhoto', 'isActive'],
   include: [{ model: UsuarioIdentidad, as: 'identity', attributes: ['firstNames', 'paternalSurname', 'maternalSurname'] }]
@@ -22,11 +24,12 @@ function nombreUsuario(usuario) {
   return [identidad?.firstNames, identidad?.paternalSurname, identidad?.maternalSurname].filter(Boolean).join(' ');
 }
 
-function ficha(conductor) {
+function ficha(conductor, enServicio) {
   return {
     id: conductor.id, usuarioId: conductor.userId, nombre: nombreUsuario(conductor.user) || 'Sin nombre',
     foto: conductor.user.profilePhoto, correo: conductor.user.email, telefono: conductor.user.phone,
-    cuentaActiva: conductor.user.isActive, estado: conductor.status, disponible: conductor.isAvailable,
+    cuentaActiva: conductor.user.isActive, estado: conductor.status,
+    disponible: conductor.user.isActive && conductor.status === 'aprobado' && enServicio,
     licencia: conductor.licenseNumber, vencimientoLicencia: conductor.licenseExpiry,
     estadoLicencia: conductor.licenseVerificationStatus, vehiculos: conductor.vehicles
   };
@@ -60,7 +63,15 @@ async function listar(solicitud, respuesta) {
       where, include: [usuarioIncluido, vehiculosIncluidos], distinct: true,
       order: [['createdAt', 'DESC'], ['id', 'DESC']], limit: limite, offset: desplazamiento
     });
-    return respuesta.json({ conductores: resultado.rows.map(ficha), total: resultado.count });
+    const ubicaciones = await ConductorUbicacion.findAll({
+      attributes: ['driver_id'],
+      where: { driver_id: resultado.rows.map(conductor => conductor.id), is_online: true }
+    });
+    const enServicio = new Set(ubicaciones.map(ubicacion => ubicacion.driver_id));
+    return respuesta.json({
+      conductores: resultado.rows.map(conductor => ficha(conductor, enServicio.has(conductor.id))),
+      total: resultado.count
+    });
   } catch (error) {
     console.error('Error al listar conductores operativos:', error.message);
     return respuesta.status(500).json({ error: 'No se pudieron cargar los conductores.' });
@@ -72,7 +83,7 @@ async function detalle(solicitud, respuesta) {
     const id = solicitud.params.driverId;
     const conductor = await Conductor.findOne({ where: { id, status: { [Op.in]: estadosOperativos } }, include: [usuarioIncluido, vehiculosIncluidos] });
     if (!conductor) return respuesta.status(404).json({ error: 'Conductor no encontrado.' });
-    const [liquidaciones, registros] = await Promise.all([
+    const [liquidaciones, registros, licencias, viajeActivo, ubicacion] = await Promise.all([
       ComisionLiquidacion.findAll({
         where: { driver_id: id }, order: [['period_start', 'DESC']],
         attributes: ['id', 'period_start', 'due_date', 'total_commission', 'amount_paid', 'status']
@@ -81,7 +92,16 @@ async function detalle(solicitud, respuesta) {
         where: { table_name: 'conductor', record_id: id },
         include: [AuditoriaRegistro.eventFilter('cambio_conduccion'), { model: Usuario, as: 'changedBy', attributes: ['email'], include: usuarioIncluido.include }],
         order: [['changed_at', 'DESC'], ['id', 'DESC']]
-      })
+      }),
+      documentos.select(`SELECT l.numero_licencia, l.fecha_vencimiento
+        FROM public.conductor_documento cd
+        JOIN public.documento d USING (id_documento)
+        JOIN public.documento_licencia l ON l.id_documento_licencia = d.id_documento
+        WHERE cd.id_conductor = :id AND d.tipo_documento = 'licenseFront'
+          AND d.vigente AND d.estado_verificacion = 'verificado'
+        ORDER BY d.creado_en DESC, d.id_documento DESC LIMIT 1`, { id }),
+      Viaje.findOne({ attributes: ['id', 'status'], where: { driverId: id, status: { [Op.in]: estadosViajeActivo } } }),
+      ConductorUbicacion.findByPk(id, { attributes: ['is_online'] })
     ]);
     const comprobantes = await ultimosComprobantes(liquidaciones.map(liquidacion => liquidacion.id));
     const hoy = fechaBolivia();
@@ -93,8 +113,12 @@ async function detalle(solicitud, respuesta) {
         total, pagado, saldo: liquidacion.status === 'pagado' ? 0 : Math.max(0, total - pagado), estado: estadoLiquidacion(liquidacion, comprobantes.get(liquidacion.id), hoy)
       };
     });
-    return respuesta.json({
-      ...ficha(conductor), saldoPendiente: comisiones.reduce((saldo, comision) => saldo + comision.saldo, 0),
+    const licencia = licencias[0];
+    return respuesta.set('Cache-Control', 'private, no-store').json({
+      ...ficha(conductor, ubicacion?.is_online === true), licencia: licencia?.numero_licencia ?? null,
+      vencimientoLicencia: licencia?.fecha_vencimiento ?? null,
+      viajeActivo: viajeActivo ? { id: viajeActivo.id, estado: viajeActivo.status } : null,
+      saldoPendiente: comisiones.reduce((saldo, comision) => saldo + comision.saldo, 0),
       comisiones: comisiones.slice(0, 12),
       historial: registros.map(registro => ({
         id: registro.id, estado: registro.new_values.status, motivo: registro.new_values.motivo,
@@ -124,7 +148,7 @@ async function cambiarEstado(solicitud, respuesta) {
 
       if (suspend) {
         const viaje = await Viaje.findOne({ attributes: ['id'], transaction, where: {
-          driverId: conductor.id, status: { [Op.in]: ['aceptado', 'llegado', 'en_curso'] }
+          driverId: conductor.id, status: { [Op.in]: estadosViajeActivo }
         } });
         if (viaje) return { codigo: 409, error: 'El conductor tiene un viaje activo. Espera a que termine.' };
       }

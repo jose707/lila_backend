@@ -4,37 +4,53 @@ const db = require('../config/baseDatos');
 const { notificar } = require('./notificacionServicio');
 const { obtenerIo } = require('../socket');
 
-async function enviarSms(telefono, cuerpo) {
-  const { TWILIO_ACCOUNT_SID: cuenta, TWILIO_AUTH_TOKEN: token, TWILIO_SMS_FROM: remitente } = process.env;
-  if (!cuenta || !token || !remitente) throw new Error('Servicio SMS sin configurar');
-  if (!/^AC[a-f0-9]{32}$/i.test(cuenta)) throw new Error('Cuenta SMS inválida');
-  const respuesta = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${cuenta}/Messages.json`, {
+async function enviarWhatsApp(telefono, nombre, ubicacion) {
+  const { WHATSAPP_PHONE_NUMBER_ID: numeroId, WHATSAPP_ACCESS_TOKEN: token,
+    WHATSAPP_API_VERSION: version = 'v25.0', WHATSAPP_TEMPLATE_LANGUAGE: idioma = 'es' } = process.env;
+  if (!numeroId || !token) throw new Error('Servicio WhatsApp sin configurar');
+  if (!/^\d+$/.test(numeroId) || !/^v\d+\.\d+$/.test(version)) {
+    throw new Error('Configuración WhatsApp inválida');
+  }
+  const respuesta = await fetch(`https://graph.facebook.com/${version}/${numeroId}/messages`, {
     method: 'POST',
     headers: {
-      Authorization: 'Basic ' + Buffer.from(`${cuenta}:${token}`).toString('base64'),
-      'Content-Type': 'application/x-www-form-urlencoded'
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json'
     },
-    body: new URLSearchParams({ From: remitente, To: telefono, Body: cuerpo }),
+    body: JSON.stringify({
+      messaging_product: 'whatsapp', recipient_type: 'individual', to: telefono.replace(/\D/g, ''),
+      type: 'template', template: {
+        name: 'alerta_emergencia_viaje', language: { code: idioma },
+        components: [{ type: 'body', parameters: [
+          { type: 'text', parameter_name: 'nombre_contacto', text: nombre },
+          { type: 'text', parameter_name: 'ubicacion', text: ubicacion }
+        ] }]
+      }
+    }),
     signal: AbortSignal.timeout(5000)
   });
   const datos = await respuesta.json().catch(() => ({}));
-  if (!respuesta.ok || !datos.sid || ['failed', 'undelivered'].includes(datos.status)) {
-    throw new Error(`Proveedor SMS rechazó el envío (${respuesta.status})`);
+  const mensaje = datos.messages?.[0];
+  if (!respuesta.ok || datos.error || !mensaje?.id ||
+    (mensaje.message_status && mensaje.message_status !== 'accepted')) {
+    const codigo = Number.isInteger(datos.error?.code) ? `, código ${datos.error.code}` : '';
+    throw new Error(`Meta rechazó el aviso WhatsApp (HTTP ${respuesta.status}${codigo})`);
   }
-  return datos.sid;
+  return mensaje.id;
 }
 
-async function enviarSmsPendientes(registros) {
-  await Promise.allSettled(registros.map(async ({ id, telefono, cuerpo }) => {
+async function enviarWhatsAppPendientes(registros, nombre, ubicacion) {
+  await Promise.allSettled(registros.map(async ({ id, telefono }) => {
     let proveedorId = null;
     let motivo = null;
     try {
-      proveedorId = await enviarSms(telefono, cuerpo);
+      proveedorId = await enviarWhatsApp(telefono, nombre, ubicacion);
     } catch (error) {
       motivo = error.name === 'TimeoutError' ? 'El proveedor no confirmó la recepción a tiempo' :
-        error.message.startsWith('Proveedor SMS') || error.message.startsWith('Servicio SMS') || error.message.startsWith('Cuenta SMS')
-          ? error.message : 'No se pudo conectar con el proveedor SMS';
+        error.message.startsWith('Meta rechazó') || error.message.startsWith('Servicio WhatsApp') || error.message.startsWith('Configuración WhatsApp')
+          ? error.message : 'No se pudo conectar con Meta para enviar WhatsApp';
     }
+    // La tabla histórica conserva su nombre; "enviado" significa aceptado por el proveedor.
     await db.query(`UPDATE public.registro_sms_emergencia
       SET estado = CASE WHEN :exito THEN 'enviado'::sms_estado ELSE 'fallido'::sms_estado END,
           proveedor_id = :proveedorId, enviado_en = CASE WHEN :exito THEN NOW() END,
@@ -57,4 +73,4 @@ async function avisarCentral(idAlerta, idViaje) {
   }));
 }
 
-module.exports = { avisarCentral, enviarSmsPendientes };
+module.exports = { avisarCentral, enviarWhatsAppPendientes };

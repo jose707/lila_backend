@@ -339,7 +339,7 @@ module.exports = {
         apellido_paterno VARCHAR(100), apellido_materno VARCHAR(100),
         numero_ci VARCHAR(20) NOT NULL UNIQUE, fecha_nacimiento DATE NOT NULL,
         fecha_emision DATE, fecha_vencimiento DATE, lugar_nacimiento VARCHAR(150),
-        direccion VARCHAR(255), ocupacion VARCHAR(150), estado_civil VARCHAR(50), grupo_sanguineo VARCHAR(5),
+        direccion VARCHAR(255), ocupacion VARCHAR(150), estado_civil VARCHAR(50),
         creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(), actualizado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
@@ -526,6 +526,17 @@ module.exports = {
 
     // ─── NOTIFICATIONS ────────────────────────────────────────────────────────
     await q(`
+      CREATE TABLE envio_notificacion (
+        id_envio_notificacion UUID PRIMARY KEY,
+        id_administrador UUID NOT NULL REFERENCES usuario(id_usuario),
+        alcance TEXT NOT NULL CHECK (alcance IN ('individual', 'pasajeros', 'conductores', 'todos')),
+        id_destinatario UUID REFERENCES usuario(id_usuario),
+        titulo VARCHAR(100) NOT NULL,
+        cuerpo TEXT NOT NULL,
+        creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CHECK ((alcance = 'individual') = (id_destinatario IS NOT NULL))
+      );
+
       CREATE TABLE notificacion (
         id_notificacion         UUID              PRIMARY KEY DEFAULT uuid_generate_v4(),
         id_usuario    UUID              NOT NULL REFERENCES usuario(id_usuario),
@@ -538,13 +549,20 @@ module.exports = {
         id_solicitud_conductor UUID REFERENCES solicitud_conductor(id_solicitud_conductor),
         id_alerta_emergencia UUID,
         id_comision UUID,
+        id_envio_notificacion UUID REFERENCES envio_notificacion(id_envio_notificacion),
+        estado_push TEXT CHECK (estado_push IN ('pendiente', 'aceptado', 'fallido', 'omitido', 'sin_confirmar')),
         CHECK (num_nonnulls(id_viaje, id_oferta_viaje, id_solicitud_conductor, id_alerta_emergencia, id_comision) <= 1),
-        enviado_en    TIMESTAMPTZ,
         leido_en    TIMESTAMPTZ,
         creado_en TIMESTAMPTZ       NOT NULL DEFAULT NOW()
       );
     `);
-    await q(`CREATE INDEX idx_notificacion_usuario ON notificacion(id_usuario);`);
+    await q(`
+      CREATE INDEX idx_notificacion_usuario ON notificacion(id_usuario);
+      CREATE INDEX idx_notificacion_envio ON notificacion(id_envio_notificacion)
+        WHERE id_envio_notificacion IS NOT NULL;
+      CREATE INDEX idx_notificacion_push_pendiente ON notificacion(creado_en, id_notificacion)
+        WHERE estado_push = 'pendiente';
+    `);
 
     // ─── COMMISSION SETTLEMENTS ───────────────────────────────────────────────
     await q(`
@@ -1063,6 +1081,7 @@ module.exports = {
     await q(`DROP TABLE IF EXISTS cobros_conductor        CASCADE;`);
     await q(`DROP TABLE IF EXISTS comision CASCADE;`);
     await q(`DROP TABLE IF EXISTS notificacion          CASCADE;`);
+    await q(`DROP TABLE IF EXISTS envio_notificacion    CASCADE;`);
     await q(`DROP TABLE IF EXISTS calificacion                CASCADE;`);
     await q(`DROP TABLE IF EXISTS pago               CASCADE;`);
     await q(`DROP TABLE IF EXISTS oferta_viaje            CASCADE;`);

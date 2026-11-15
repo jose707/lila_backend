@@ -14,7 +14,6 @@ const UsuarioIdentidad = sequelize.define('UserIdentity', {
   birthPlace: { type: DatosTipos.STRING, allowNull: true, field: 'birth_place' },
   address: { type: DatosTipos.STRING, allowNull: true }, occupation: { type: DatosTipos.STRING, allowNull: true },
   maritalStatus: { type: DatosTipos.STRING, allowNull: true, field: 'marital_status' },
-  bloodType: { type: DatosTipos.STRING, allowNull: true, field: 'blood_type' },
   verificationStatus: { type: DatosTipos.STRING, allowNull: false, defaultValue: 'pendiente', field: 'verification_status' },
   verifiedAt: { type: DatosTipos.DATE, allowNull: true, field: 'verified_at' },
   verifiedBy: { type: DatosTipos.UUID, allowNull: true, field: 'verified_by' },

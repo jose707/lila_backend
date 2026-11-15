@@ -83,7 +83,10 @@ const aprobarConductor = async (solicitud, respuesta) => {
       await transaccion.rollback();
       return respuesta.status(400).json({ error: 'Falta la dirección o ubicación válida del domicilio.' });
     }
-    const erroresDocumentos = [...new Set(correcciones.validarDatosDocumentales(metadatos, identidad).map(error => error.mensaje))];
+    const erroresDocumentos = [...new Set([
+      ...correcciones.validarCamposOcr(metadatos, REQUERIDO_ARCHIVOS),
+      ...correcciones.validarDatosDocumentales(metadatos, identidad)
+    ].map(error => error.mensaje))];
     if (erroresDocumentos.length) {
       await transaccion.rollback();
       return respuesta.status(400).json({
@@ -195,6 +198,12 @@ const decideSolicitud = (estado) => async (solicitud, respuesta) => {
     if (reciente?.id !== request.id) {
       await transaccion.rollback();
       return respuesta.status(409).json({ error: 'Existe una versión más reciente de esta solicitud.' });
+    }
+    const erroresOcr = correcciones.validarCamposOcr(request.metadata || {}, verificadoDocumentos);
+    if (erroresOcr.length) {
+      await transaccion.rollback();
+      const detalles = erroresOcr.map(error => error.mensaje);
+      return respuesta.status(400).json({ error: detalles.join('\n'), detalles });
     }
     await SolicitudArchivo.update(
       { status: 'verificado', verifiedAt: new Date(), verifiedBy: solicitud.user.id },
