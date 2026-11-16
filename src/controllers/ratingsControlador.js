@@ -1,6 +1,8 @@
 // backend/src/controllers/ratingsControlador.js
 const { Calificacion: Calificacion, Viaje: Viaje, Conductor: Conductor, Usuario: Usuario } = require('../models');
 
+const { obtenerResumenCalificaciones } = require('../services/resumenCalificaciones');
+
 const calcularConSemilla = filas => {
   const suma = filas.reduce((total, fila) => total + (Number(fila.rating) || 0), 5);
   return Math.round(suma / (filas.length + 1) * 10) / 10;
@@ -165,61 +167,18 @@ const obtenerMiCalificacion = async (solicitud, respuesta) => {
       return respuesta.status(401).json({ error: 'Usuario no autenticado' });
     }
 
-    const sequelize = require("../config/baseDatos");
-
-    // Fórmula con semilla: (5 + suma) / (1 + cantidad)
-    const calcularConSemilla = (filas) => {
-      const lista = Array.isArray(filas) ? filas : filas ? [filas] : [];
-      const semilla = 5;
-      const total = lista.length + 1;
-      const suma = lista.reduce(
-        (acumulador, r) => acumulador + (parseFloat(r.rating) || 0),
-        semilla
-      );
-      return Math.round(suma / total * 10) / 10;
-    };
-
-    // Rating del pasajero (calificaciones hechas por conductores)
-    const [pasajeroFilas] = await sequelize.query(
-      `SELECT c.rating FROM calificacion c JOIN viaje v ON v.id = c.ride_id WHERE v.passenger_id = :userId AND c.rater_type = 'conductor'`,
-      { replacements: { userId: usuarioId } }
-    );
-    const pasajeroCalificacion = calcularConSemilla(pasajeroFilas);
-
-    // Viajes completados como pasajero
-    const [pasajeroViajeFilas] = await sequelize.query(
-      `SELECT COUNT(*) as total FROM viaje WHERE passenger_id = :userId AND status = 'completado'`,
-      { replacements: { userId: usuarioId } }
-    );
-    const pasajeroViajes = parseInt(pasajeroViajeFilas?.[0]?.total || 0, 10);
-
-    // Rating del conductor (calificaciones hechas por pasajeros)
-    let conductorCalificacion = null;
-    let conductorId = null;
-    let conductorViajes = 0;
-    const conductorRegistro = await Conductor.findOne({ where: { userId: usuarioId } });
-    if (conductorRegistro) {
-      conductorId = conductorRegistro.id;
-      const [conductorFilas] = await sequelize.query(
-        `SELECT c.rating FROM calificacion c JOIN viaje v ON v.id = c.ride_id WHERE v.driver_id = :driverId AND c.rater_type = 'pasajero'`,
-        { replacements: { driverId: conductorId } }
-      );
-      conductorCalificacion = calcularConSemilla(conductorFilas);
-
-      // Viajes completados como conductor
-      const [conductorViajeFilas] = await sequelize.query(
-        `SELECT COUNT(*) as total FROM viaje WHERE driver_id = :driverId AND status = 'completado'`,
-        { replacements: { driverId: conductorId } }
-      );
-      conductorViajes = parseInt(conductorViajeFilas?.[0]?.total || 0, 10);
-    }
+    const [pasajero, conductor] = await Promise.all([
+      obtenerResumenCalificaciones(usuarioId, 'pasajero'),
+      Conductor.findOne({ where: { userId: usuarioId }, attributes: ['id'] })
+    ]);
+    const resumenConductor = conductor ? await obtenerResumenCalificaciones(conductor.id, 'conductor') : null;
 
     respuesta.status(200).json({
-      passengerRating: pasajeroCalificacion,
-      driverRating: conductorCalificacion,
-      driverId: conductorId,
-      passengerTrips: pasajeroViajes,
-      driverTrips: conductorViajes
+      passengerRating: pasajero.rating,
+      driverRating: resumenConductor?.rating ?? null,
+      driverId: conductor?.id ?? null,
+      passengerTrips: pasajero.trips,
+      driverTrips: resumenConductor?.trips ?? 0
     });
   } catch (error) {
     console.error('❌ [getMyRating] Error:', error);

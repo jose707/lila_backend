@@ -1,20 +1,28 @@
 'use strict';
 const servicio = require("../services/rapidaAsignacionServicio");
 const Conductor = require("../models/Conductor");
+const Usuario = require("../models/Usuario");
 const Vehiculo = require("../models/Vehiculo");
 const UsuarioIdentidad = require("../models/UsuarioIdentidad");
 const ViajeParada = require("../models/ViajeParada");
 const { obtenerIo: obtenerIo } = require('../socket');
-async function detalles(viaje) {
+const { obtenerResumenCalificaciones } = require('../services/resumenCalificaciones');
+
+const camposNombre = ['firstNames', 'paternalSurname', 'maternalSurname'];
+const nombreCompleto = identidad => camposNombre.map(campo => identidad?.[campo]?.trim()).filter(Boolean).join(' ') || null;
+
+async function detalles(viaje, usuarioId) {
   if (!viaje) return null;
   const conductor = await Conductor.findByPk(viaje.driverId, {
     attributes: ['userId']
   });
-  const [identidad, vehiculo, paradas] = await Promise.all([
+  const mostrarPasajero = conductor?.userId === usuarioId && viaje.status === 'solicitado';
+  const mostrarConductor = !!conductor && viaje.passengerId === usuarioId && viaje.status === 'solicitado';
+  const [identidad, vehiculo, paradas, pasajero, resumenPasajero, resumenConductor] = await Promise.all([
   conductor ?
   UsuarioIdentidad.findOne({
     where: { userId: conductor.userId },
-    attributes: ['firstNames', 'paternalSurname']
+    attributes: camposNombre
   }) :
   null,
   Vehiculo.findOne({
@@ -30,22 +38,33 @@ async function detalles(viaje) {
     where: { ride_id: viaje.id },
     attributes: ['address', 'sequence'],
     order: [['sequence', 'ASC']]
-  })]
+  }),
+  mostrarPasajero ? Usuario.findByPk(viaje.passengerId, {
+    attributes: ['id', 'profilePhoto'],
+    include: [{ association: 'identity', attributes: [...camposNombre, 'verificationStatus'], required: false }]
+  }) : null,
+  mostrarPasajero ? obtenerResumenCalificaciones(viaje.passengerId, 'pasajero') : null,
+  mostrarConductor ? obtenerResumenCalificaciones(viaje.driverId, 'conductor') : null]
   );
   return {
     ...viaje.toJSON(),
-    driverName: identidad ?
-    [identidad.firstNames, identidad.paternalSurname].
-    filter(Boolean).
-    join(' ') :
-    'Conductor verificado',
+    driverName: nombreCompleto(identidad),
+    ...(resumenConductor && { driverRating: resumenConductor.rating, driverTrips: resumenConductor.trips }),
     vehicle: vehiculo,
-    stops: paradas
+    stops: paradas,
+    ...(pasajero && {
+      passenger: {
+        name: nombreCompleto(pasajero.identity),
+        photo: pasajero.profilePhoto || null,
+        verified: pasajero.identity?.verificationStatus === 'verificado',
+        ...resumenPasajero
+      }
+    })
   };
 }
 const rutaApi = (accion) => async (solicitud, respuesta) => {
   try {
-    const viaje = await detalles(await accion(solicitud));
+    const viaje = await detalles(await accion(solicitud), solicitud.user.id);
     const ahora = Date.now();
     respuesta.json({
       ride: viaje,

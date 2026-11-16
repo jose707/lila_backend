@@ -867,25 +867,54 @@ baseDatosTest('la reserva rápida responde con conductor.id y carga sus relacion
     if (sql.includes('public.documento_licencia')) consultasLicencia.push(sql);
     return originalSelect(sql, ...argumentos);
   });
-  const { Conductor, Vehiculo } = require('../../models');
+  const { Conductor, Vehiculo, Usuario, UsuarioIdentidad, Calificacion } = require('../../models');
+  const controlador = require('../../controllers/rapidaAsignacionControlador');
   const conductor = await Conductor.findByPk(cercanoConductor, {
     include: [{ model: Vehiculo, as: 'vehicles' }]
   });
   comprobar.equal(conductor.id, cercanoConductor);
   comprobar.equal(Object.hasOwn(conductor.toJSON(), 'idConductor'), false);
   comprobar.equal(conductor.vehicles.length, 1);
-  const res = {
+  const crearRespuesta = () => ({
     code: 200,
     status(code) { this.code = code; return this; },
     json(body) { this.body = body; return this; }
-  };
-  await require('../../controllers/rapidaAsignacionControlador').reservar({
+  });
+  const foto = `/api/usuarios/${pasajero}/foto-perfil`;
+  await Usuario.update({ profilePhoto: foto }, { where: { id: pasajero } });
+  await UsuarioIdentidad.create({
+    userId: pasajero, firstNames: 'María Elena', paternalSurname: 'Paz', maternalSurname: 'Flores', ciNumber: '1234567',
+    birthDate: '1990-01-01', verificationStatus: 'verificado'
+  });
+  await UsuarioIdentidad.create({
+    userId: conductor.userId, firstNames: 'Ana', paternalSurname: 'Rojas', maternalSurname: 'Loza', ciNumber: '7654321',
+    birthDate: '1991-01-01', verificationStatus: 'verificado'
+  });
+  const anterior = await servicio.reservar(pasajero, entrada());
+  await anterior.update({ status: 'completado' });
+  await Calificacion.bulkCreate([
+    { rideId: anterior.id, raterType: 'pasajero', rating: 4 },
+    { rideId: anterior.id, raterType: 'conductor', rating: 3 }
+  ]);
+  const res = crearRespuesta();
+  await controlador.reservar({
     user: { id: pasajero }, body: entrada()
   }, res);
   comprobar.equal(res.code, 200);
   comprobar.equal(res.body.ride.driverId, cercanoConductor);
   comprobar.ok(res.body.ride.vehicle);
+  comprobar.equal(res.body.ride.passenger, undefined);
+  comprobar.equal(res.body.ride.driverName, 'Ana Rojas Loza');
+  comprobar.equal(res.body.ride.driverRating, 4.5);
+  comprobar.equal(res.body.ride.driverTrips, 1);
   comprobar.equal(consultasLicencia.length, 0);
+
+  const recibida = crearRespuesta();
+  await controlador.actual({ user: { id: conductor.userId }, query: { role: 'conductor' } }, recibida);
+  comprobar.equal(recibida.code, 200);
+  comprobar.deepEqual(recibida.body.ride.passenger, {
+    name: 'María Elena Paz Flores', photo: foto, verified: true, rating: 4, trips: 1
+  });
 });
 
 baseDatosTest('la zona conserva el atributo id al consultar las columnas renombradas', async () => {
