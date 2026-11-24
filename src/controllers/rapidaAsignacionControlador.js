@@ -16,8 +16,9 @@ async function detalles(viaje, usuarioId) {
   const conductor = await Conductor.findByPk(viaje.driverId, {
     attributes: ['userId']
   });
+  if (viaje.passengerId !== usuarioId && conductor?.userId !== usuarioId) return null;
   const mostrarPasajero = conductor?.userId === usuarioId && viaje.status === 'solicitado';
-  const mostrarConductor = !!conductor && viaje.passengerId === usuarioId && viaje.status === 'solicitado';
+  const mostrarConductor = !!conductor && viaje.passengerId === usuarioId && viaje.status !== 'solicitado';
   const [identidad, vehiculo, paradas, pasajero, resumenPasajero, resumenConductor] = await Promise.all([
   conductor ?
   UsuarioIdentidad.findOne({
@@ -46,11 +47,18 @@ async function detalles(viaje, usuarioId) {
   mostrarPasajero ? obtenerResumenCalificaciones(viaje.passengerId, 'pasajero') : null,
   mostrarConductor ? obtenerResumenCalificaciones(viaje.driverId, 'conductor') : null]
   );
+  const [intentos] = mostrarPasajero ? await require('../config/baseDatos').query(
+    "SELECT vence_en FROM public.asignacion_rapida_intento WHERE id_viaje = :id AND id_conductor = :conductor AND estado = 'pendiente'",
+    { replacements: { id: viaje.id, conductor: viaje.driverId }, esquemaFisico: true }
+  ) : [[]];
+  const datos = viaje.toJSON();
+  if (viaje.status === 'solicitado' && !mostrarPasajero) datos.driverId = null;
   return {
-    ...viaje.toJSON(),
-    driverName: nombreCompleto(identidad),
+    ...datos,
+    ...(mostrarPasajero && { venceOfertaEn: intentos[0]?.vence_en }),
+    driverName: viaje.status === 'solicitado' && !mostrarPasajero ? null : nombreCompleto(identidad),
     ...(resumenConductor && { driverRating: resumenConductor.rating, driverTrips: resumenConductor.trips }),
-    vehicle: vehiculo,
+    vehicle: viaje.status === 'solicitado' && !mostrarPasajero ? null : vehiculo,
     stops: paradas,
     ...(pasajero && {
       passenger: {
@@ -70,7 +78,7 @@ const rutaApi = (accion) => async (solicitud, respuesta) => {
       ride: viaje,
       serverTime: new Date(ahora).toISOString(),
       segundosRestantes: viaje?.status === 'solicitado'
-        ? Math.max(0, Math.ceil((new Date(viaje.expiresAt).getTime() - ahora) / 1000))
+        ? Math.max(0, Math.ceil((new Date(viaje.venceOfertaEn ?? viaje.expiresAt).getTime() - ahora) / 1000))
         : 0
     });
   } catch (error) {
@@ -108,9 +116,12 @@ module.exports = {
   ),
   obtener: rutaApi((solicitud) => servicio.obtener(solicitud.user.id, solicitud.params.rideId)),
   confirmar: rutaApi((solicitud) =>
-  servicio.finalizarReserva(solicitud.user.id, solicitud.params.rideId, true)
+  servicio.responderConductor(solicitud.params.rideId, solicitud.user.id, true)
+  ),
+  rechazar: rutaApi((solicitud) =>
+    servicio.responderConductor(solicitud.params.rideId, solicitud.user.id, false)
   ),
   cancelar: rutaApi((solicitud) =>
-  servicio.finalizarReserva(solicitud.user.id, solicitud.params.rideId, false)
+  servicio.cancelarReserva(solicitud.user.id, solicitud.params.rideId)
   )
 };

@@ -436,6 +436,14 @@ module.exports = {
     await q(`CREATE INDEX idx_viaje_estado       ON viaje(estado);`);
     await q(`CREATE INDEX idx_viaje_service_area ON viaje(id_zona_servicio);`);
 
+    await q(`CREATE TABLE asignacion_rapida_intento (
+      id_viaje UUID NOT NULL REFERENCES viaje(id_viaje) ON DELETE CASCADE,
+      id_conductor UUID NOT NULL REFERENCES conductor(id_conductor),
+      estado VARCHAR(12) NOT NULL CHECK (estado IN ('pendiente','aceptado','rechazado','vencido','cancelado')),
+      vence_en TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY (id_viaje, id_conductor)
+    );`);
+
     // ─── RIDE OFFERS ──────────────────────────────────────────────────────────
     await q(`
       CREATE TABLE oferta_viaje (
@@ -1086,6 +1094,7 @@ module.exports = {
     await q(`DROP TABLE IF EXISTS calificacion                CASCADE;`);
     await q(`DROP TABLE IF EXISTS pago               CASCADE;`);
     await q(`DROP TABLE IF EXISTS oferta_viaje            CASCADE;`);
+    await q(`DROP TABLE IF EXISTS asignacion_rapida_intento CASCADE;`);
     await q(`DROP TABLE IF EXISTS viaje                  CASCADE;`);
     await q(`DROP TABLE IF EXISTS motivo_cancelacion   CASCADE;`);
     await q(`DROP TABLE IF EXISTS zona_servicio          CASCADE;`);

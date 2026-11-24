@@ -731,10 +731,13 @@ const verificarIdentidad = async (solicitud, respuesta) => {
       throw Object.assign(new Error('La comparación facial no devolvió un resultado válido. Intenta nuevamente.'), { status: 502 });
     }
     if (!livenessPasado) {
-      return respuesta.status(422).json({ error: 'No se pudo confirmar la prueba de vida. Vuelve a intentarlo.' });
+      return respuesta.status(422).json({
+        code: 'LIVENESS_NOT_CONFIRMED',
+        error: 'No se pudo confirmar la prueba de vida. Repite la prueba en un lugar bien iluminado, con el rostro despejado y siguiendo las indicaciones de la cámara.'
+      });
     }
     if (rostroCoincidenciaConfianza < rostroCoincidenciaUmbral) {
-      return respuesta.status(422).json({ error: livenessHabilitado ?
+      return respuesta.status(422).json({ code: 'FACE_MATCH_NOT_CONFIRMED', error: livenessHabilitado ?
         'El rostro no coincide suficientemente con el CI. Repite la prueba en buena iluminación.' :
         'La selfie no coincide suficientemente con el rostro del CI. Toma otra selfie, con buena iluminación y el rostro visible.' });
     }

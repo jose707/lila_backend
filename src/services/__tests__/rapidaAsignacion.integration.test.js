@@ -116,6 +116,14 @@ antesCada(async () => {
 });
 const baseDatosTest = (nombre, accion) => test(nombre, { skip: !habilitado }, accion);
 
+
+async function usuarioConductor(id) {
+  return (await require('../../models/Conductor').findByPk(id)).userId;
+}
+async function aceptarReserva(viaje) {
+  return servicio.responderConductor(viaje.id, await usuarioConductor(viaje.driverId), true);
+}
+
 async function crearComisionConViajes(cantidad=1){
   const repo=require('../documentosRepositorio');const {ComisionLiquidacion,CobrosConductor}=require('../../models');
   await repo.query("INSERT INTO public.zona_servicio(nombre,limite,tasa_comision) VALUES('Zona comisión',ST_GeomFromText('POLYGON((-69 -17,-67 -17,-67 -16,-69 -16,-69 -17))',4326),0.2)");
@@ -998,17 +1006,19 @@ baseDatosTest('la reserva rápida responde con conductor.id y carga sus relacion
     user: { id: pasajero }, body: entrada()
   }, res);
   comprobar.equal(res.code, 200);
-  comprobar.equal(res.body.ride.driverId, cercanoConductor);
-  comprobar.ok(res.body.ride.vehicle);
+  comprobar.equal(res.body.ride.driverId, null);
+  comprobar.equal(res.body.ride.vehicle, null);
   comprobar.equal(res.body.ride.passenger, undefined);
-  comprobar.equal(res.body.ride.driverName, 'Ana Rojas Loza');
-  comprobar.equal(res.body.ride.driverRating, 4.5);
-  comprobar.equal(res.body.ride.driverTrips, 1);
+  comprobar.equal(res.body.ride.driverName, null);
   comprobar.equal(consultasLicencia.length, 0);
 
   const recibida = crearRespuesta();
   await controlador.actual({ user: { id: conductor.userId }, query: { role: 'conductor' } }, recibida);
   comprobar.equal(recibida.code, 200);
+  comprobar.ok(recibida.body.segundosRestantes <= 10);
+  comprobar.deepEqual(recibida.body.ride.dropoffLocation.coordinates, [-68.15, -16.52]);
+  comprobar.equal(recibida.body.ride.dropoff_address, 'Destino');
+  comprobar.deepEqual(recibida.body.ride.stops, []);
   comprobar.deepEqual(recibida.body.ride.passenger, {
     name: 'María Elena Paz Flores', photo: foto, verified: true, rating: 4, trips: 1
   });
@@ -1268,7 +1278,7 @@ baseDatosTest(
     comprobar.equal(viaje.pickupSurcharge, undefined);
     comprobar.equal(viaje.discountAmount, undefined);
     comprobar.equal(Number(viaje.finalFare), Number(viaje.totalFare));
-    comprobar.ok(new Date(viaje.expiresAt) - Date.now() <= 20000);
+    comprobar.ok(new Date(viaje.expiresAt) - Date.now() <= 60000);
     comprobar.equal((await servicio.reservar(pasajero, solicitud)).id, viaje.id);
     comprobar.equal(await Viaje.count(), 1);
   }
@@ -1287,53 +1297,61 @@ baseDatosTest(
     await db.query(
       "UPDATE viaje SET status = 'vencido'; UPDATE ubicacion_conductor SET is_online = false"
     );
-    await comprobar.rejects(
-      servicio.reservar(segundoPasajero, entrada(), undefined, { searchWindowMs: 0 }),
-      (error) => error.code === 'NO_DRIVERS'
-    );
+    comprobar.equal((await servicio.reservar(segundoPasajero, entrada())).driverId, null);
     await db.query(
       "UPDATE ubicacion_conductor SET is_online = true, location_recorded_at = NOW(), location = ST_SetSRID(ST_MakePoint(-68.15,-16.54),4326)"
     );
-    await comprobar.rejects(
-      servicio.reservar(segundoPasajero, entrada(), undefined, { searchWindowMs: 0 }),
-      (error) => error.code === 'NO_DRIVERS'
-    );
+    comprobar.equal((await servicio.reservar(segundoPasajero, entrada())).driverId, null);
     await db.query(
       "UPDATE ubicacion_conductor SET location = ST_SetSRID(ST_MakePoint(-68.15,-16.501),4326)"
     );
     await db.query("UPDATE public.documento_ruat SET tipo_vehiculo='motocicleta'", {esquemaFisico:true});
-    await comprobar.rejects(
-      servicio.reservar(segundoPasajero, entrada(), undefined, { searchWindowMs: 0 }),
-      (error) => error.code === 'NO_DRIVERS'
-    );
+    comprobar.equal((await servicio.reservar(segundoPasajero, entrada())).driverId, null);
   }
 );
-baseDatosTest('espera brevemente y asigna apenas aparece un conductor', async () => {
+baseDatosTest('busca durante 60 segundos y recupera la solicitud cuando aparece un conductor', async () => {
   await db.query("UPDATE ubicacion_conductor SET is_online = false");
-  const iniciado = Date.now();
-  const reserva = servicio.reservar(pasajero, entrada(), undefined, {
-    searchWindowMs: 1500,
-    searchIntervalMs: 100
-  });
-  await new Promise((resolver) => setTimeout(resolver, 250));
-  await db.query(
-    "UPDATE ubicacion_conductor SET is_online = true, location_recorded_at = NOW() WHERE driver_id = :id",
-    { replacements: { id: cercanoConductor } }
-  );
-  comprobar.equal((await reserva).driverId, cercanoConductor);
-  comprobar.ok(Date.now() - iniciado < 1500);
+  const viaje = await servicio.reservar(pasajero, entrada());
+  comprobar.equal(viaje.driverId, null);
+  comprobar.ok(new Date(viaje.expiresAt) - Date.now() > 58000);
+  comprobar.equal((await servicio.actual(pasajero)).id, viaje.id);
+  await db.query("UPDATE ubicacion_conductor SET is_online = true, location_recorded_at = NOW() WHERE driver_id = :id",
+    { replacements: { id: cercanoConductor } });
+  comprobar.equal((await servicio.actual(pasajero)).driverId, cercanoConductor);
 });
 baseDatosTest('termina la búsqueda al vencer el plazo sin conductores', async () => {
   await db.query("UPDATE ubicacion_conductor SET is_online = false");
-  const iniciado = Date.now();
-  await comprobar.rejects(
-    servicio.reservar(pasajero, entrada(), undefined, {
-      searchWindowMs: 250,
-      searchIntervalMs: 50
-    }),
-    (error) => error.code === 'NO_DRIVERS'
-  );
-  comprobar.ok(Date.now() - iniciado >= 250);
+  const viaje = await servicio.reservar(pasajero, entrada());
+  await viaje.update({ expiresAt: new Date(Date.now() - 1000) });
+  await servicio.vencerReservas();
+  comprobar.equal((await viaje.reload()).status, 'vencido');
+  comprobar.equal(await servicio.actual(pasajero), null);
+});
+baseDatosTest('cada conductor tiene diez segundos y el rechazo busca otro sin repetir conductores', async () => {
+  const viaje = await servicio.reservar(pasajero, entrada());
+  const [intentos] = await db.query('SELECT * FROM public.asignacion_rapida_intento WHERE id_viaje=:id',
+    { replacements: { id: viaje.id }, esquemaFisico: true });
+  comprobar.ok(new Date(intentos[0].vence_en) - Date.now() > 8000);
+  comprobar.ok(new Date(intentos[0].vence_en) - Date.now() <= 10000);
+  const segundo = await servicio.responderConductor(viaje.id, await usuarioConductor(cercanoConductor), false);
+  comprobar.equal(segundo.driverId, lejanoConductor);
+  await comprobar.rejects(aceptarReserva(viaje), e => e.code === 'OFFER_EXPIRED');
+  const sinConductor = await servicio.responderConductor(viaje.id, await usuarioConductor(lejanoConductor), false);
+  comprobar.equal(sinConductor.driverId, null);
+  comprobar.equal(sinConductor.status, 'solicitado');
+  comprobar.equal((await servicio.actual(pasajero)).driverId, null);
+  const [historial] = await db.query('SELECT estado FROM public.asignacion_rapida_intento WHERE id_viaje=:id',
+    { replacements: { id: viaje.id }, esquemaFisico: true });
+  comprobar.deepEqual(historial.map(i => i.estado), ['rechazado', 'rechazado']);
+});
+baseDatosTest('una oferta vencida pasa al siguiente conductor y una respuesta tardía no acepta el viaje', async () => {
+  const viaje = await servicio.reservar(pasajero, entrada());
+  await db.query("UPDATE public.asignacion_rapida_intento SET vence_en=clock_timestamp()-interval '1 second'",
+    { esquemaFisico: true });
+  const siguiente = await aceptarReserva(viaje);
+  comprobar.equal(siguiente.status, 'solicitado');
+  comprobar.equal(siguiente.driverId, lejanoConductor);
+  comprobar.equal((await aceptarReserva(siguiente)).status, 'aceptado');
 });
 baseDatosTest('reservas concurrentes nunca comparten conductor', async () => {
   const resultados = await Promise.all([
@@ -1354,7 +1372,7 @@ baseDatosTest(
     servicio.reservar(segundoPasajero, entrada(), undefined, { searchWindowMs: 0 })]
     );
     comprobar.equal(
-      resultados.filter((resultado) => resultado.status === 'fulfilled').length,
+      resultados.filter((resultado) => resultado.status === 'fulfilled' && resultado.value.driverId).length,
       1
     );
   }
@@ -1414,62 +1432,50 @@ baseDatosTest('vencimiento y cancelación liberan sin revivir la reserva', async
   const viaje = await servicio.reservar(pasajero, entrada());
   await viaje.update({ expiresAt: new Date(Date.now() - 1000) });
   comprobar.equal(
-    (await servicio.finalizarReserva(pasajero, viaje.id, true)).status,
+    (await aceptarReserva(viaje)).status,
     'vencido'
   );
   comprobar.equal(await servicio.actual(pasajero), null);
   const siguiente = await servicio.reservar(pasajero, entrada());
   comprobar.equal(siguiente.driverId, cercanoConductor);
   comprobar.equal(
-    (await servicio.finalizarReserva(pasajero, siguiente.id, false)).status,
+    (await servicio.cancelarReserva(pasajero, siguiente.id)).status,
     'cancelado'
   );
   comprobar.equal(
-    (await servicio.finalizarReserva(pasajero, siguiente.id, true)).status,
+    (await aceptarReserva(siguiente)).status,
     'cancelado'
   );
 });
 baseDatosTest(
-  'solo el pasajero dueño puede confirmar; desconexión invalida la confirmación',
+  'solo el conductor ofrecido puede aceptar; desconexión busca otro conductor',
   async () => {
     const viaje = await servicio.reservar(pasajero, entrada());
-    await comprobar.rejects(
-      servicio.finalizarReserva(segundoPasajero, viaje.id, true),
-      (error) => error.status === 403
-    );
-    const [[conductor]] = await db.query(
-      "SELECT user_id FROM conductor WHERE id = :id",
-      { replacements: { id: viaje.driverId } }
-    );
-    await comprobar.rejects(
-      servicio.finalizarReserva(conductor.user_id, viaje.id, true),
-      (error) => error.status === 403
-    );
-    comprobar.equal((await servicio.actual(conductor.user_id, true)).id, viaje.id);
-    await db.query(
-      "UPDATE ubicacion_conductor SET is_online = false WHERE driver_id = :id",
-      { replacements: { id: viaje.driverId } }
-    );
-    comprobar.equal(
-      (await servicio.finalizarReserva(pasajero, viaje.id, true)).status,
-      'vencido'
-    );
+    await comprobar.rejects(servicio.responderConductor(viaje.id, pasajero, true), e => e.status === 409);
+    await comprobar.rejects(servicio.responderConductor(viaje.id, segundoPasajero, true), e => e.status === 409);
+    await comprobar.rejects(servicio.cancelarReserva(segundoPasajero, viaje.id), e => e.status === 403);
+    await db.query("UPDATE ubicacion_conductor SET is_online = false WHERE driver_id = :id",
+      { replacements: { id: viaje.driverId } });
+    const siguiente = await aceptarReserva(viaje);
+    comprobar.equal(siguiente.status, 'solicitado');
+    comprobar.equal(siguiente.driverId, lejanoConductor);
   }
 );
+
 baseDatosTest(
-  'confirmación automática e idempotente; cancelar tarde no desasigna',
+  'aceptación del conductor idempotente; cancelar tarde no desasigna',
   async () => {
     const viaje = await servicio.reservar(pasajero, entrada());
     comprobar.equal(
-      (await servicio.finalizarReserva(pasajero, viaje.id, true)).status,
+      (await aceptarReserva(viaje)).status,
       'aceptado'
     );
     comprobar.equal(
-      (await servicio.finalizarReserva(pasajero, viaje.id, true)).status,
+      (await aceptarReserva(viaje)).status,
       'aceptado'
     );
     comprobar.equal(
-      (await servicio.finalizarReserva(pasajero, viaje.id, false)).status,
+      (await servicio.cancelarReserva(pasajero, viaje.id)).status,
       'aceptado'
     );
   }
@@ -1490,8 +1496,8 @@ baseDatosTest(
   async () => {
     const viaje = await servicio.reservar(pasajero, entrada());
     const [primero, segundo] = await Promise.all([
-    servicio.finalizarReserva(pasajero, viaje.id, true),
-    servicio.finalizarReserva(pasajero, viaje.id, false)]
+    aceptarReserva(viaje),
+    servicio.cancelarReserva(pasajero, viaje.id)]
     );
     comprobar.equal(primero.status, segundo.status);
     comprobar.ok(['aceptado', 'cancelado'].includes(primero.status));

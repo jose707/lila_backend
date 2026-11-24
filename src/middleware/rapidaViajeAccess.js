@@ -19,6 +19,9 @@ module.exports = (rol) => async (solicitud, respuesta, siguiente) => {
     {
       return respuesta.status(403).json({ error: 'Este viaje no te pertenece.' });
     }
+    if (assigned && !pasajero && viaje.status === 'solicitado') {
+      return respuesta.status(409).json({ error: 'Primero acepta la solicitud de asignación rápida.' });
+    }
     return siguiente();
   } catch (error) {
     return siguiente(error);

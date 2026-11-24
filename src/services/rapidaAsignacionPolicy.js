@@ -1,7 +1,8 @@
 'use strict';
 
 const RADIO_METROS = 3000;
-const RESERVA_SEGUNDOS = 20;
+const RESERVA_SEGUNDOS = 60;
+const RESPUESTA_CONDUCTOR_SEGUNDOS = 10;
 const UBICACION_MAXIMO_ANTIGUEDAD_SEGUNDOS = 60;
 const ACTIVO_ESTADOS = ['aceptado', 'llegado', 'en_curso'];
 const fallar = (estado, mensaje, codigo) =>
@@ -22,6 +23,7 @@ function validarPunto(punto) {
 }
 
 module.exports = {
+  RESPUESTA_CONDUCTOR_SEGUNDOS,
   RADIO_METROS: RADIO_METROS,
   RESERVA_SEGUNDOS: RESERVA_SEGUNDOS,
   UBICACION_MAXIMO_ANTIGUEDAD_SEGUNDOS: UBICACION_MAXIMO_ANTIGUEDAD_SEGUNDOS,

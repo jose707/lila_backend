@@ -17,6 +17,7 @@ enrutador.post('/:rideId/compartir', autenticacionIntermediario, crearEnlace);
 enrutador.post('/rapida/reservar', autenticacionIntermediario, verificadoIdentidad, rapidoAsignacion.reservar);
 enrutador.get('/rapida/actual', autenticacionIntermediario, rapidoAsignacion.actual);
 enrutador.get('/:rideId/rapida', autenticacionIntermediario, rapidoAsignacion.obtener);
+enrutador.post('/:rideId/rapida/rechazar', autenticacionIntermediario, rapidoAsignacion.rechazar);
 enrutador.post('/:rideId/rapida/confirmar', autenticacionIntermediario, rapidoAsignacion.confirmar);
 enrutador.post('/:rideId/rapida/cancelar', autenticacionIntermediario, rapidoAsignacion.cancelar);
 
@@ -35,13 +36,13 @@ enrutador.get('/tarifas', autenticacionIntermediario, viajeControlador.obtenerCo
 const negociacionOnly = async (solicitud, respuesta, siguiente) => {
   try {
     const viaje = await require("../models/Viaje").findByPk(solicitud.params.rideId);
-    if (viaje?.requestMode === 'asignacion_rapida') return respuesta.status(409).json({ error: 'La asignación rápida no admite aceptación del conductor ni ofertas.' });
+    if (viaje?.requestMode === 'asignacion_rapida') return respuesta.status(409).json({ error: 'Responde la asignación rápida desde su solicitud; no admite ofertas.' });
     return siguiente();
   } catch (error) {return siguiente(error);}
 };
 
 // Rutas dinámicas DESPUÉS (con parámetros)
-enrutador.get('/:rideId/ruta', autenticacionIntermediario, obtenerViajeRuta);
+enrutador.get('/:rideId/ruta', autenticacionIntermediario, rapidoAcceso('participant'), obtenerViajeRuta);
 enrutador.get('/:id', autenticacionIntermediario, rapidoAcceso('participant'), viajeControlador.obtenerViajePorId);
 enrutador.put('/:rideId/aceptar', autenticacionIntermediario, negociacionOnly, viajeControlador.aceptarViaje);
 enrutador.put('/:rideId/llegada', autenticacionIntermediario, rapidoAcceso('conductor'), viajeControlador.llegadoViaje);
