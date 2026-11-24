@@ -5,7 +5,7 @@ const { analizarRecorteRectangulo, recorteAFotograma } = require('./documentoRec
 
 const CONDUCTOR_OCR_DOCUMENTS = new Set([
 'licenseFront', 'licenseBack', 'ticPhoto', 'ruatPhoto', 'soatPhoto', 'antecedentsPhoto',
-'domicileProof']
+'domicileProof', 'ownerCiFront', 'ownerCiBack']
 );
 const OCR_CONTRAST = 1.5;
 

@@ -187,6 +187,7 @@ const obtenerTodosUsuarios = async (solicitud, respuesta) => {
         attributes: ['userId'], where: { [Operador.and]: coincidencias }
       });
       condicionesClausula[Operador.or] = [
+        { nombreGoogle: { [Operador.iLike]: `%${consulta}%` } },
         { email: { [Operador.iLike]: `%${consulta}%` } },
         { phone: { [Operador.iLike]: `%${consulta}%` } },
         { id: { [Operador.in]: identidades.map(identidad => identidad.userId) } }
@@ -200,7 +201,7 @@ const obtenerTodosUsuarios = async (solicitud, respuesta) => {
     const usuarios = await Usuario.findAll({
       where: condicionesClausula,
       attributes: { exclude: ['password'] },
-      include: [{ model: UsuarioIdentidad, as: 'identity', attributes: ['firstNames', 'paternalSurname', 'maternalSurname'] }],
+      include: [{ model: UsuarioIdentidad, as: 'identity', attributes: ['firstNames', 'paternalSurname', 'maternalSurname', 'verificationStatus'] }],
       limit: parseInt(limite),
       offset: parseInt(desplazamiento),
       order: [['createdAt', 'DESC'], ['id', 'DESC']]
@@ -210,8 +211,9 @@ const obtenerTodosUsuarios = async (solicitud, respuesta) => {
 
     const mapeadoUsuarios = usuarios.map((usuario) => {
       const plano = usuario.toJSON();
-      plano.name = [plano.identity?.firstNames, plano.identity?.paternalSurname, plano.identity?.maternalSurname].
-      filter(Boolean).join(' ');
+      plano.name = plano.identity?.verificationStatus === 'verificado'
+        ? [plano.identity.firstNames, plano.identity.paternalSurname, plano.identity.maternalSurname].filter(Boolean).join(' ')
+        : plano.nombreGoogle || '';
       return plano;
     });
     respuesta.status(200).json({
@@ -751,7 +753,7 @@ const obtenerDetalleUsuario = async (solicitud, respuesta) => {
       return respuesta.status(400).json({ error: 'Identificador de usuario inválido.' });
     }
     const usuario = await Usuario.findByPk(usuarioId, {
-      attributes: ['id', 'email', 'phone', 'role', 'createdAt', 'profilePhoto', 'isActive', 'phoneVerified'],
+      attributes: ['id', 'email', 'phone', 'role', 'createdAt', 'profilePhoto', 'isActive', 'phoneVerified', 'nombreGoogle'],
       include: [{ model: UsuarioIdentidad, as: 'identity', attributes: ['firstNames', 'paternalSurname', 'maternalSurname', 'verificationStatus'] }]
     });
     if (!usuario) return respuesta.status(404).json({ error: 'Usuario no encontrado.' });
@@ -775,7 +777,9 @@ const obtenerDetalleUsuario = async (solicitud, respuesta) => {
     return respuesta.set('Cache-Control', 'private, no-store').json({
       usuario: {
         id: usuario.id,
-        nombre: [identidad?.firstNames, identidad?.paternalSurname, identidad?.maternalSurname].filter(Boolean).join(' ') || 'Sin nombre',
+        nombre: identidad?.verificationStatus === 'verificado'
+          ? [identidad.firstNames, identidad.paternalSurname, identidad.maternalSurname].filter(Boolean).join(' ')
+          : usuario.nombreGoogle || 'Sin nombre',
         correo: usuario.email,
         telefono: usuario.phone,
         rol: usuario.role,
@@ -783,7 +787,8 @@ const obtenerDetalleUsuario = async (solicitud, respuesta) => {
         foto: usuario.profilePhoto,
         activo: usuario.isActive,
         telefonoVerificado: usuario.phoneVerified,
-        estadoIdentidad: identidad?.verificationStatus ?? null
+        estadoIdentidad: identidad?.verificationStatus ?? null,
+        ...await require('../services/identidadAcceso').accesoIdentidad(usuario.id, identidad?.verificationStatus === 'verificado')
       },
       solicitudConductor,
       historial: registros.map(registro => {

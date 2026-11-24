@@ -50,6 +50,8 @@ const subirCampos = subir.fields([
 { name: 'carRight', maxCount: 1 },
 { name: 'soatPhoto', maxCount: 1 },
 { name: 'ruatPhoto', maxCount: 1 },
+{ name: 'ownerCiFront', maxCount: 1 },
+{ name: 'ownerCiBack', maxCount: 1 },
 { name: 'domicileProof', maxCount: 1 }]
 );
 

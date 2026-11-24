@@ -15,3 +15,14 @@ test('coordenadas: permite cero, rechaza NaN, texto y fuera de rango', () => {
     comprobar.ok(!validarPunto({ latitude: latitud, longitude: 0, address: 'Origen' }));
   }
 });
+
+test('PU-06: valida coordenadas completas y sus límites', () => {
+  const punto = { latitude: -16.5, longitude: -68.15, address: 'Origen' };
+  comprobar.ok(validarPunto(punto));
+  comprobar.ok(!validarPunto({ latitude: punto.latitude, address: punto.address }));
+  for (const invalido of [
+    { ...punto, latitude: 91 }, { ...punto, latitude: -91 },
+    { ...punto, longitude: 181 }, { ...punto, longitude: -181 }
+  ]) comprobar.ok(!validarPunto(invalido));
+  comprobar.ok(validarPunto({ ...punto, latitude: 90, longitude: 180 }));
+});

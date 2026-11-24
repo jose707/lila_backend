@@ -233,69 +233,64 @@ exports.obtenerUbicacionConductor = async (solicitud, respuesta) => {
 
 exports.obtenerConductoresCercanos = async (solicitud, respuesta) => {
   try {
-    const { latitude: latitud, longitude: longitud, radiusKm: radioKm = 5 } = solicitud.query;
-
-    if (!latitud || !longitud) {
+    const latitud = Number(solicitud.query.latitude);
+    const longitud = Number(solicitud.query.longitude);
+    const radioKm = Number(solicitud.query.radiusKm ?? 5);
+    if ([solicitud.query.latitude, solicitud.query.longitude].some(valor =>
+      valor == null || String(valor).trim() === '') ||
+      ![latitud, longitud, radioKm].every(Number.isFinite) ||
+      Math.abs(latitud) > 90 || Math.abs(longitud) > 180 || radioKm <= 0) {
       return respuesta.status(400).json({
-        success: false,
-        message: 'Missing required fields: latitude, longitude'
+        success: false, message: 'Latitud, longitud o radio de búsqueda inválidos.'
       });
     }
 
-    // Convert radius to meters
-    const radioMetros = radioKm * 1000;
-
-    // Query drivers within radius using ST_DWithin
-    const cercanoConductores = await sequelize.query(
-      `
-      SELECT
-        dl.driver_id,
-        d.id,
-        d."userId",
-        CONCAT_WS(' ', ui.first_names, ui.paternal_surname, ui.maternal_surname) AS name,
-        u."profilePhoto",
-        ST_Y(dl.location) as latitude,
-        ST_X(dl.location) as longitude,
-        dl.heading,
-        dl.speed,
-        dl.is_online,
-        dl.updated_at,
-        ST_Distance(
-          dl.location,
-          ST_GeomFromText('POINT(${longitud} ${latitud})', 4326)::geography
-        ) as distance_meters
-      FROM ubicacion_conductor dl
-      JOIN conductor d ON dl.driver_id = d.id
-      JOIN usuario u ON d."userId" = u.id
-      LEFT JOIN documento_ci ui ON ui.user_id = u.id
-      WHERE dl.is_online = true
-      AND ST_DWithin(
-        dl.location::geography,
-        ST_GeomFromText('POINT(${longitud} ${latitud})', 4326)::geography,
-        ${radioMetros}
-      )
-      ORDER BY distance_meters ASC
-      `,
-      { type: sequelize.QueryTypes.SELECT }
-    );
+    const conductores = await sequelize.query(`
+      SELECT c.id_conductor, c.id_usuario,
+        CONCAT_WS(' ', ci.nombres, ci.apellido_paterno, ci.apellido_materno) AS nombre,
+        u.foto_perfil, ST_Y(uc.ubicacion) AS latitud, ST_X(uc.ubicacion) AS longitud,
+        uc.rumbo, uc.velocidad, uc.conectado, uc.actualizado_en,
+        ST_Distance(uc.ubicacion::geography,
+          ST_SetSRID(ST_MakePoint(:longitud,:latitud),4326)::geography) AS distancia_metros
+      FROM public.ubicacion_conductor uc
+      JOIN public.conductor c ON uc.id_conductor = c.id_conductor
+      JOIN public.usuario u ON c.id_usuario = u.id_usuario
+      LEFT JOIN LATERAL (
+        SELECT identidad.nombres, identidad.apellido_paterno, identidad.apellido_materno
+        FROM public.usuario_documento vinculo
+        JOIN public.documento_ci identidad ON identidad.id_documento_ci = vinculo.id_documento
+        JOIN public.documento documento ON documento.id_documento = vinculo.id_documento
+        WHERE vinculo.id_usuario = u.id_usuario AND documento.vigente = true
+        ORDER BY documento.creado_en DESC, documento.id_documento
+        LIMIT 1
+      ) ci ON true
+      WHERE uc.conectado = true
+        AND ST_DWithin(uc.ubicacion::geography,
+          ST_SetSRID(ST_MakePoint(:longitud,:latitud),4326)::geography,:radioMetros)
+      ORDER BY distancia_metros ASC, c.id_conductor
+    `, {
+      type: sequelize.QueryTypes.SELECT,
+      esquemaFisico: true,
+      replacements: { latitud, longitud, radioMetros: radioKm * 1000 }
+    });
 
     return respuesta.status(200).json({
       success: true,
-      data: cercanoConductores.map((d) => ({
-        driver_id: d.driver_id,
-        driver_user_id: d.userId,
-        name: d.name,
-        profile_photo: d.profilePhoto,
-        latitude: parseFloat(d.latitude),
-        longitude: parseFloat(d.longitude),
-        heading: d.heading,
-        speed: d.speed,
-        is_online: d.is_online,
-        distance_km: (d.distance_meters / 1000).toFixed(2),
-        updated_at: d.updated_at
+      data: conductores.map(conductor => ({
+        driver_id: conductor.id_conductor,
+        driver_user_id: conductor.id_usuario,
+        name: conductor.nombre,
+        profile_photo: conductor.foto_perfil,
+        latitude: parseFloat(conductor.latitud),
+        longitude: parseFloat(conductor.longitud),
+        heading: conductor.rumbo,
+        speed: conductor.velocidad,
+        is_online: conductor.conectado,
+        distance_km: (conductor.distancia_metros / 1000).toFixed(2),
+        updated_at: conductor.actualizado_en
       })),
-      count: cercanoConductores.length,
-      radius_km: parseFloat(radioKm)
+      count: conductores.length,
+      radius_km: radioKm
     });
   } catch (error) {
     console.error(

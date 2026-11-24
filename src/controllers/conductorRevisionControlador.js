@@ -9,9 +9,10 @@ const Conductor = require("../models/Conductor");
 const Vehiculo = require("../models/Vehiculo");
 const { notificar: notificar } = require("../services/notificacionServicio");
 const correcciones = require('../services/documentosCorreccionServicio');
+const { TIPOS_CI_PROPIETARIO, requiereCiPropietario } = require('../services/ciPropietario');
 
 const REQUERIDO_ARCHIVOS = [
-'licenseFront', 'licenseBack', 'ticPhoto', 'antecedentsPhoto',
+'licenseFront', 'licenseBack', 'antecedentsPhoto',
 'ruatPhoto', 'soatPhoto', 'carFront', 'carBack',
 'domicileProof'];
 
@@ -60,7 +61,14 @@ const aprobarConductor = async (solicitud, respuesta) => {
       return respuesta.status(400).json({ error: 'La cédula de identidad aún no está verificada.' });
     }
     const archivos = await SolicitudArchivo.findAll({ where: { requestId: solicitudId }, transaction: transaccion });
-    const faltanteArchivos = REQUERIDO_ARCHIVOS.filter((tipo) => !archivos.some((archivo) => archivo.fileType === tipo));
+    const requeridos = [...REQUERIDO_ARCHIVOS, ...archivos.filter(archivo => archivo.fileType === 'ticPhoto').map(archivo => archivo.fileType),
+      ...TIPOS_CI_PROPIETARIO.filter(tipo =>
+      requiereCiPropietario(request.metadata?.ocr?.ruatPhoto?.fields, identidad) || archivos.some(archivo => archivo.fileType === tipo))];
+    if (requeridos.some(tipo => !verificadoDocumentos.includes(tipo))) {
+      await transaccion.rollback();
+      return respuesta.status(400).json({ error: 'Revisa y aprueba todos los documentos adjuntos, incluido el TIC o CI del propietario cuando corresponda.' });
+    }
+    const faltanteArchivos = requeridos.filter((tipo) => !archivos.some((archivo) => archivo.fileType === tipo));
     if (faltanteArchivos.length) {
       await transaccion.rollback();
       return respuesta.status(400).json({ error: `Faltan archivos: ${faltanteArchivos.join(', ')}.` });
@@ -84,7 +92,7 @@ const aprobarConductor = async (solicitud, respuesta) => {
       return respuesta.status(400).json({ error: 'Falta la dirección o ubicación válida del domicilio.' });
     }
     const erroresDocumentos = [...new Set([
-      ...correcciones.validarCamposOcr(metadatos, REQUERIDO_ARCHIVOS),
+      ...correcciones.validarCamposOcr(metadatos, requeridos),
       ...correcciones.validarDatosDocumentales(metadatos, identidad)
     ].map(error => error.mensaje))];
     if (erroresDocumentos.length) {
@@ -100,7 +108,7 @@ const aprobarConductor = async (solicitud, respuesta) => {
       await transaccion.commit();
       return respuesta.json({message:'Documentos aprobados. Debe realizarse la evaluación psicológica.'});
     }
-    if (REQUERIDO_ARCHIVOS.some(tipo=>!archivos.some(a=>a.fileType===tipo&&a.status==='verificado'))) {
+    if (requeridos.some(tipo=>!archivos.some(a=>a.fileType===tipo&&a.status==='verificado'))) {
       await transaccion.rollback();
       return respuesta.status(409).json({error:'Primero debe completarse la aprobación documental.'});
     }
@@ -155,12 +163,13 @@ const decideSolicitud = (estado) => async (solicitud, respuesta) => {
   }
   const rechazadoDocumentos = [...new Set(solicitud.body.rejectedDocuments)];
   const verificadoDocumentos = [...new Set(solicitud.body.verifiedDocuments)];
-  const carasLicencia = ['licenseFront', 'licenseBack'];
-  if (carasLicencia.some(cara => rechazadoDocumentos.includes(cara))) {
-    for (const cara of carasLicencia) {
+  for (const caras of [['licenseFront', 'licenseBack'], TIPOS_CI_PROPIETARIO]) {
+    if (caras.some(cara => rechazadoDocumentos.includes(cara))) {
+    for (const cara of caras) {
       if (!rechazadoDocumentos.includes(cara)) rechazadoDocumentos.push(cara);
       const indice = verificadoDocumentos.indexOf(cara);
       if (indice !== -1) verificadoDocumentos.splice(indice, 1);
+    }
     }
   }
   if (estado === 'observado' && !rechazadoDocumentos.length) {
@@ -173,8 +182,8 @@ const decideSolicitud = (estado) => async (solicitud, respuesta) => {
   if (rechazadoDocumentos.some((tipo) => verificadoDocumentos.includes(tipo))) {
     return respuesta.status(400).json({ error: 'Un documento no puede estar verificado y rechazado a la vez.' });
   }
-  if (rechazadoDocumentos.some((tipo) => !REQUERIDO_ARCHIVOS.includes(tipo)) ||
-  verificadoDocumentos.some((tipo) => !REQUERIDO_ARCHIVOS.includes(tipo))) {
+  if (rechazadoDocumentos.some((tipo) => ![...REQUERIDO_ARCHIVOS, 'ticPhoto', ...TIPOS_CI_PROPIETARIO].includes(tipo)) ||
+  verificadoDocumentos.some((tipo) => ![...REQUERIDO_ARCHIVOS, 'ticPhoto', ...TIPOS_CI_PROPIETARIO].includes(tipo))) {
     return respuesta.status(400).json({ error: 'Hay tipos de documento inválidos.' });
   }
   let transaccion;
@@ -200,6 +209,11 @@ const decideSolicitud = (estado) => async (solicitud, respuesta) => {
       return respuesta.status(409).json({ error: 'Existe una versión más reciente de esta solicitud.' });
     }
     const erroresOcr = correcciones.validarCamposOcr(request.metadata || {}, verificadoDocumentos);
+    if (TIPOS_CI_PROPIETARIO.some(tipo => verificadoDocumentos.includes(tipo))) {
+      const identidad = await UsuarioIdentidad.findOne({ where: { userId: request.userId }, transaction: transaccion });
+      erroresOcr.push(...require('../services/ciPropietario').validarCiPropietario(request.metadata || {}, identidad)
+        .filter(error => verificadoDocumentos.includes(error.documento)));
+    }
     if (erroresOcr.length) {
       await transaccion.rollback();
       const detalles = erroresOcr.map(error => error.mensaje);

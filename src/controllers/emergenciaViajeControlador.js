@@ -96,13 +96,13 @@ async function listarEmergencias(solicitud, respuesta) {
   try {
     const [alertas] = await db.query(`SELECT a.id_alerta_emergencia AS "idAlerta", a.id_viaje AS "idViaje",
       a.activada_en AS "activadaEn", ST_Y(a.ubicacion) AS latitud, ST_X(a.ubicacion) AS longitud,
-      NULLIF(CONCAT_WS(' ', i.nombres, i.apellido_paterno, i.apellido_materno), '') AS nombre, u.telefono,
+      COALESCE(NULLIF(CONCAT_WS(' ', i.nombres, i.apellido_paterno, i.apellido_materno), ''), u.nombre_google) AS nombre, u.telefono,
       CASE WHEN v.id_pasajero = a.id_usuario THEN 'pasajero'
         WHEN c.id_usuario = a.id_usuario THEN 'conductor' END AS participante,
       a.direccion_ubicacion AS "direccionAlerta", a.notas,
       v.estado AS "estadoViaje", v.direccion_recogida AS recogida, v.direccion_destino AS destino,
       v.iniciado_en AS "viajeIniciadoEn",
-      NULLIF(TRIM(CONCAT_WS(' ', ip.nombres, ip.apellido_paterno, ip.apellido_materno)), '') AS "nombrePasajero",
+      COALESCE(NULLIF(TRIM(CONCAT_WS(' ', ip.nombres, ip.apellido_paterno, ip.apellido_materno)), ''), p.nombre_google) AS "nombrePasajero",
       p.telefono AS "telefonoPasajero",
       NULLIF(TRIM(CONCAT_WS(' ', ic.nombres, ic.apellido_paterno, ic.apellido_materno)), '') AS "nombreConductor",
       cu.telefono AS "telefonoConductor",

@@ -12,11 +12,16 @@ const Usuario = sequelize.define(
       primaryKey: true
     },
     name: {
-      // Nombre oficial vive únicamente en user_identities. Se conserva como
-      // virtual por compatibilidad temporal con respuestas de la aplicación.
       type: DatosTipos.VIRTUAL,
-      allowNull: true
+      allowNull: true,
+      get() {
+        const identidad = this.getDataValue('identity');
+        return identidad?.verificationStatus === 'verificado'
+          ? [identidad.firstNames, identidad.paternalSurname, identidad.maternalSurname].filter(Boolean).join(' ')
+          : this.getDataValue('nombreGoogle') || '';
+      }
     },
+    nombreGoogle: { type: DatosTipos.STRING(255), field: 'nombre_google' },
     email: {
       type: DatosTipos.STRING,
       allowNull: false,

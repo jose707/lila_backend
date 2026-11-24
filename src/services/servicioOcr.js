@@ -2422,6 +2422,8 @@ const ANALIZADORES = {
 
 /** Campos requeridos por tipo de documento (para saber si la extracción fue completa). */
 const REQUERIDOS_POR_TIPO = {
+  ownerCiFront: ['ciNumber'],
+  ownerCiBack: [],
   ciFront: ['ciNumber', 'firstNames', 'surnames', 'birthDate', 'issueDate', 'expiryDate'],
   ciBack: ['birthPlace', 'address', 'occupation', 'maritalStatus'],
   licenseFront: ['licenseNumber', 'fullName', 'nationality', 'issueDate', 'licenseExpiryDate', 'birthDate', 'licenseCategory'],
@@ -2456,20 +2458,22 @@ function camposRequeridosDocumento(tipo, texto) {
  * @returns {{fields: object, rawText: string, missing: string[], facesFound: number, rejected: boolean, rejectReason: string, words: Array}}
  */
 async function extraerDocumento(buffer, documentoTipo) {
+  const esCiPropietario = documentoTipo === 'ownerCiFront' || documentoTipo === 'ownerCiBack';
+  const tipoLectura = esCiPropietario ? (documentoTipo === 'ownerCiFront' ? 'ciFront' : 'ciBack') : documentoTipo;
   const { text: brutoTexto, facesFound: rostrosEncontrado, words: palabras } = await anotarImagenBuffer(
     buffer, documentoTipo === 'ciFront' || documentoTipo === 'ciBack'
   );
 
-  const analizador = ANALIZADORES[documentoTipo];
-  const campos = analizador ? analizador(brutoTexto, { words: palabras, documentType: documentoTipo }) : {};
+  const analizador = ANALIZADORES[tipoLectura];
+  const campos = analizador ? analizador(brutoTexto, { words: palabras, documentType: tipoLectura }) : {};
 
   // Validación de tipo/lado (por ahora solo CI)
   let rechazado = false;
   let rechazarMotivo = '';
   let clasificar = null;
-  if (documentoTipo === 'ciFront' || documentoTipo === 'ciBack') {
+  if (tipoLectura === 'ciFront' || tipoLectura === 'ciBack') {
     clasificar = clasificarCI(brutoTexto, rostrosEncontrado);
-    const v = validarCi(brutoTexto, rostrosEncontrado, documentoTipo);
+    const v = validarCi(brutoTexto, rostrosEncontrado, tipoLectura);
     rechazado = v.rejected;
     rechazarMotivo = v.rejectReason;
   } else if (documentoTipo === 'ticPhoto' && !/TARJETA\s+(?:DE\s+)?IDENTIFICACION\s+(?:DEL?\s+)?CONDUCTOR|\bT\.?I\.?C\.?\b/.test(normalizar(brutoTexto))) {

@@ -92,6 +92,7 @@ module.exports = {
         rol            usuario_rol    NOT NULL DEFAULT 'pasajero',
         modo_actual    VARCHAR(50),
         foto_perfil   VARCHAR(500),
+        nombre_google VARCHAR(255),
         activo       BOOLEAN      NOT NULL DEFAULT true,
         telefono_verificado  BOOLEAN      NOT NULL DEFAULT false,
         ultimo_acceso      TIMESTAMPTZ,
@@ -162,7 +163,7 @@ module.exports = {
     await q(`
       CREATE TABLE documento (
         id_documento UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-        tipo_documento VARCHAR(40) NOT NULL CHECK (tipo_documento IN ('ciFront', 'ciBack', 'profilePhoto', 'licenseFront', 'licenseBack', 'ticPhoto', 'antecedentsPhoto', 'ruatPhoto', 'soatPhoto', 'domicileProof', 'carFront', 'carBack', 'carLeft', 'carRight', 'commissionProof', 'psychologicalReport', 'ci')),
+        tipo_documento VARCHAR(40) NOT NULL CHECK (tipo_documento IN ('ownerCiFront', 'ownerCiBack', 'ciFront', 'ciBack', 'profilePhoto', 'licenseFront', 'licenseBack', 'ticPhoto', 'antecedentsPhoto', 'ruatPhoto', 'soatPhoto', 'domicileProof', 'carFront', 'carBack', 'carLeft', 'carRight', 'commissionProof', 'psychologicalReport', 'ci')),
         ruta_archivo VARCHAR(500), tipo_mime VARCHAR(100),
         id_documento_principal UUID REFERENCES documento(id_documento),
         evidencia_cifrada TEXT, origen_evidencia VARCHAR(100) CONSTRAINT documento_origen_evidencia_valido CHECK (origen_evidencia IN ('captura_camara','archivo_subido','prueba_vida','semilla_desarrollo')), consentimiento_version VARCHAR(100), consentimiento_en TIMESTAMPTZ,

@@ -15,6 +15,7 @@ const { isoFecha: isoFecha, comprobarAdulto: comprobarAdulto, compararIdentidadM
 const { sellar: sellar, unseal: unseal } = require("../services/identidadSessionCrypto");
 const { invokeLambda: invokeLambda } = require("../services/rostroLivenessLambda");
 const crypto = require('crypto');
+const { accesoIdentidad } = require('../services/identidadAcceso');
 
 const CI_OCR_COMPROBANTE_VINCULACION = (usuarioId) => `${usuarioId}:ci-ocr-precheck-v1`;
 const CI_OCR_COMPROBANTE_VIGENCIA_MILISEGUNDOS = 10 * 60 * 1000;
@@ -43,10 +44,10 @@ const generarToken = (usuario) => {
 // Helper function to build response user object with driver rating
 const construirUsuarioRespuestaObjeto = async (usuario) => {
   const identidad = await UsuarioIdentidad.findOne({ where: { userId: usuario.id } });
-  const officialNombre = identidad ?
+  const officialNombre = identidad?.verificationStatus === 'verificado' ?
   [identidad.firstNames, identidad.paternalSurname, identidad.maternalSurname].
   filter(Boolean).join(' ') :
-  '';
+  usuario.nombreGoogle || '';
   const respuestaUsuario = {
     id: usuario.id,
     createdAt: usuario.createdAt,
@@ -57,6 +58,7 @@ const construirUsuarioRespuestaObjeto = async (usuario) => {
     telefonoVerificado: usuario.phoneVerified,
     estadoVerificacionIdentidad: identidad?.verificationStatus || 'pendiente',
     documentosIdentidadEnviados: !!identidad,
+    ...await accesoIdentidad(usuario.id, identidad?.verificationStatus === 'verificado'),
     motivoRechazoIdentidad: identidad?.verificationStatus === 'rechazado' ? identidad.rejectionReason : null,
     rol: usuario.role,
     fotoPerfil: usuario.profilePhoto,
@@ -72,6 +74,7 @@ const construirUsuarioRespuestaObjeto = async (usuario) => {
       where: { userId: usuario.id }
     });
     if (conductor) {
+      respuestaUsuario.estadoConductor = conductor.status;
       respuestaUsuario.calificacionConductor = conductor.rating;
       respuestaUsuario.totalViajesComoConductor = conductor.totalRides || 0;
       console.log('✅ Perfil del conductor encontrado:', {
@@ -370,6 +373,7 @@ const googleAutenticacion = async (solicitud, respuesta) => {
       usuario = await Usuario.create({
         email: correo,
         phone: '', // Valor por defecto para Google Auth
+        nombreGoogle: nombre || null,
         profilePhoto: foto,
         password: 'google_auth', // Valor por defecto para Google Auth
         role: 'user',
@@ -448,6 +452,7 @@ const verificarTelefonoOtp = async (solicitud, respuesta) => {
       // Create new user from Firebase with the data sent from frontend
       usuario = await Usuario.create({
         email: correo, // Use the actual Google email
+        nombreGoogle: nombre || null,
         phone: telefono,
         firebaseUid,
         profilePhoto: fotoUrl || null, // Save the photo URL from Google
@@ -461,6 +466,7 @@ const verificarTelefonoOtp = async (solicitud, respuesta) => {
       // Update user with latest data from frontend
       await usuario.update({
         email: correo || usuario.email,
+        nombreGoogle: nombre || usuario.nombreGoogle,
         phone: telefono,
         profilePhoto: [`/api/usuarios/${usuario.id}/foto-perfil`, `/api/users/${usuario.id}/profile-photo`].includes(usuario.profilePhoto) ?
         usuario.profilePhoto : fotoUrl || usuario.profilePhoto,
@@ -577,7 +583,11 @@ const leerIdentidadDocumentos = async (cuerpo, frontalImagen, reversoImagen) => 
         status: 422
       });
     }
-    return { front: frontal, back: reverso, fields: validarIdentidad(frontal, reverso), processedImages: imagenesProcesadas, ciFormat: ciFormatear, mrzComparison: mrzComparacion, ocrPreview: vistaPrevia };
+    const campos = validarIdentidad(frontal, reverso);
+    if (ciFormatear === 'current' && mrzComparacion !== 'match') {
+      throw Object.assign(new Error('No se pudo confirmar la zona MRZ con el frente del CI. Repite las capturas.'), { status: 422 });
+    }
+    return { front: frontal, back: reverso, fields: campos, processedImages: imagenesProcesadas, ciFormat: ciFormatear, mrzComparison: mrzComparacion, ocrPreview: vistaPrevia };
   } catch (error) {
     if (error.status === 422) {
       // Solo para mostrar al titular qué leyó OCR cuando falla la validación.
@@ -691,11 +701,14 @@ const verificarIdentidad = async (solicitud, respuesta) => {
         documentImageBase64: imagenParaComparar.toString('base64')
       });
       if (biometricResultado.status !== 'SUCCEEDED') {
-        return respuesta.status(422).json({ error: 'No se completó la prueba de vida. Vuelve a iniciarla antes de confirmar el CI.' });
+        return respuesta.status(503).json({ error: 'No se completó la prueba de vida. Vuelve a iniciarla antes de confirmar el CI.' });
       }
       const livenessUmbral = Number(process.env.FACE_LIVENESS_MIN_CONFIDENCE);
       if (!Number.isFinite(livenessUmbral) || livenessUmbral < 0 || livenessUmbral > 100) {
         throw Object.assign(new Error('Configura FACE_LIVENESS_MIN_CONFIDENCE para validar la prueba de vida.'), { status: 503 });
+      }
+      if (biometricResultado.livenessConfidence == null || !Number.isFinite(Number(biometricResultado.livenessConfidence))) {
+        throw Object.assign(new Error('La prueba de vida no devolvió un resultado válido. Intenta nuevamente.'), { status: 502 });
       }
       livenessPasado = Number(biometricResultado.livenessConfidence) >= livenessUmbral;
     } else {
@@ -714,10 +727,13 @@ const verificarIdentidad = async (solicitud, respuesta) => {
       throw Object.assign(new Error('Configura FACE_MATCH_MIN_CONFIDENCE para validar la comparación facial.'), { status: 503 });
     }
     const rostroCoincidenciaConfianza = Number(biometricResultado.faceMatchConfidence);
+    if (biometricResultado.faceMatchConfidence == null || !Number.isFinite(rostroCoincidenciaConfianza)) {
+      throw Object.assign(new Error('La comparación facial no devolvió un resultado válido. Intenta nuevamente.'), { status: 502 });
+    }
     if (!livenessPasado) {
       return respuesta.status(422).json({ error: 'No se pudo confirmar la prueba de vida. Vuelve a intentarlo.' });
     }
-    if (!Number.isFinite(rostroCoincidenciaConfianza) || rostroCoincidenciaConfianza < rostroCoincidenciaUmbral) {
+    if (rostroCoincidenciaConfianza < rostroCoincidenciaUmbral) {
       return respuesta.status(422).json({ error: livenessHabilitado ?
         'El rostro no coincide suficientemente con el CI. Repite la prueba en buena iluminación.' :
         'La selfie no coincide suficientemente con el rostro del CI. Toma otra selfie, con buena iluminación y el rostro visible.' });
@@ -831,7 +847,7 @@ const completarRostroLiveness = async (solicitud, respuesta) => {
     const resultado = await invokeLambda({ action: 'verifySession', sessionId: sesionId, documentImageBase64: imagenParaComparar.toString('base64') });
     const esCompletar = resultado.status === 'SUCCEEDED';
     if (!esCompletar) {
-      return respuesta.status(422).json({ error: resultado.feedback || 'La prueba no se completó. Iníciala nuevamente.', status: resultado.status || 'FAILED' });
+      return respuesta.status(503).json({ error: resultado.feedback || 'La prueba no se completó. Iníciala nuevamente.', status: resultado.status || 'FAILED' });
     }
 
     const livenessUmbral = Number(process.env.FACE_LIVENESS_MIN_CONFIDENCE);

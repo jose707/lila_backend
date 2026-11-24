@@ -4,8 +4,9 @@ const UsuarioIdentidad = require("../models/UsuarioIdentidad");
 const sequelize = require("../config/baseDatos");
 const { unseal: unseal } = require("../services/identidadSessionCrypto");
 
-const officialNombre = (identidad) => [identidad?.firstNames, identidad?.paternalSurname, identidad?.maternalSurname].
-filter(Boolean).join(' ');
+const officialNombre = (identidad, alternativo) => identidad?.verificationStatus === 'verificado'
+  ? [identidad.firstNames, identidad.paternalSurname, identidad.maternalSurname].filter(Boolean).join(' ')
+  : alternativo || '';
 
 const obtenerUsuarioPerfil = async (solicitud, respuesta) => {
   try {
@@ -23,7 +24,7 @@ const obtenerUsuarioPerfil = async (solicitud, respuesta) => {
     }
 
     respuesta.status(200).json({
-      user: { ...usuario.toJSON(), name: officialNombre(usuario.identity) }
+      user: { ...usuario.toJSON(), name: officialNombre(usuario.identity, usuario.nombreGoogle) }
     });
   } catch (error) {
     console.error('Error al obtener perfil:', error);
@@ -67,7 +68,7 @@ const actualizarUsuarioPerfil = async (solicitud, respuesta) => {
       message: 'Perfil actualizado correctamente',
       user: {
         id: usuario.id,
-        name: officialNombre(await UsuarioIdentidad.findOne({ where: { userId: usuarioId } })),
+        name: officialNombre(await UsuarioIdentidad.findOne({ where: { userId: usuarioId } }), usuario.nombreGoogle),
         email: usuario.email,
         phone: usuario.phone,
         role: usuario.role,

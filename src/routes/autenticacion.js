@@ -42,6 +42,7 @@ enrutador.post(
   autenticacionIntermediario,
   identidadVerificacionHabilitado,
   identidadSubir,
+  rostroLivenessHabilitado,
   autenticacionControlador.verificarIdentidad
 );
 enrutador.post('/prueba-vida/sesion', autenticacionIntermediario, identidadVerificacionHabilitado, rostroLivenessHabilitado, autenticacionControlador.iniciarRostroVitalidad);

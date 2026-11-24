@@ -2,7 +2,7 @@
 const repo = require('./documentosRepositorio');
 const PDFDocument = require('pdfkit');
 
-const documentosRequeridos = ['licenseFront', 'licenseBack', 'ticPhoto', 'antecedentsPhoto',
+const documentosRequeridos = ['licenseFront', 'licenseBack', 'antecedentsPhoto',
   'ruatPhoto', 'soatPhoto', 'carFront', 'carBack', 'domicileProof'];
 const columnas = ['N°', 'Nombre completo', 'CI', 'Teléfono', 'Correo', 'Documentos aprobados'];
 const fecha = valor => valor ? new Intl.DateTimeFormat('es-BO', {
@@ -35,6 +35,10 @@ async function obtenerPendientesPsicologia() {
       HAVING COUNT(DISTINCT d.tipo_documento) = :cantidad
     ) revision ON true
     WHERE s.estado = 'pendiente'
+      AND NOT EXISTS (SELECT 1 FROM public.solicitud_documento sd
+        JOIN public.documento d USING (id_documento)
+        WHERE sd.id_solicitud_conductor = s.id_solicitud_conductor
+          AND d.tipo_documento IN ('ticPhoto', 'ownerCiFront', 'ownerCiBack') AND d.estado_verificacion <> 'verificado')
       AND NOT EXISTS (SELECT 1 FROM public.evaluacion_psicologica e
         WHERE e.id_solicitud_conductor = s.id_solicitud_conductor AND e.estado = 'realizada')
     ORDER BY nombre, ci.numero_ci, s.id_solicitud_conductor

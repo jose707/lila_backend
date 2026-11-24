@@ -52,20 +52,21 @@ const nombreParticipante = (identidad) =>
 const nombresDeUsuarios = async (ids) => {
   const usuariosIds = [...new Set(ids.filter(Boolean))];
   if (!usuariosIds.length) return new Map();
-  const identidades = await UsuarioIdentidad.findAll({
-    where: { userId: usuariosIds },
-    attributes: ['userId', 'firstNames', 'paternalSurname', 'maternalSurname', 'verificationStatus']
+  const usuarios = await Usuario.findAll({
+    where: { id: usuariosIds }, attributes: ['id', 'nombreGoogle'],
+    include: [{ model: UsuarioIdentidad, as: 'identity',
+      attributes: ['firstNames', 'paternalSurname', 'maternalSurname', 'verificationStatus'] }]
   });
-  return new Map(identidades.map(identidad => [identidad.userId, {
-    name: nombreParticipante(identidad),
-    firstNames: identidad.firstNames?.trim() || null,
-    identidadVerificada: identidad.verificationStatus === 'verificado'
+  return new Map(usuarios.map(usuario => [usuario.id, {
+    name: usuario.identity?.verificationStatus === 'verificado' ? nombreParticipante(usuario.identity) : usuario.nombreGoogle || '',
+    firstNames: usuario.identity?.verificationStatus === 'verificado' ? usuario.identity.firstNames?.trim() : usuario.nombreGoogle || null,
+    identidadVerificada: usuario.identity?.verificationStatus === 'verificado'
   }]));
 };
 
 const identidadConNombre = {
   association: 'identity',
-  attributes: ['firstNames', 'paternalSurname', 'maternalSurname'],
+  attributes: ['firstNames', 'paternalSurname', 'maternalSurname', 'verificationStatus'],
   required: false
 };
 
@@ -286,7 +287,7 @@ const crearViaje = async (solicitud, respuesta) => {
           { type: sequelize.QueryTypes.SELECT }
         ),
         Usuario.findByPk(pasajeroId, {
-          attributes: ['id', 'name', 'phone', 'profilePhoto'],
+          attributes: ['id', 'name', 'nombreGoogle', 'phone', 'profilePhoto'],
           include: [identidadConNombre]
         }),
         calcularCalificacion(pasajeroId, 'pasajero')]
@@ -299,7 +300,7 @@ const crearViaje = async (solicitud, respuesta) => {
 
         const viajeContenido = {
           rideId: viaje.id,
-          passengerName: nombreParticipante(pasajero?.identity) || pasajero?.name || 'Pasajero',
+          passengerName: (pasajero?.identity?.verificationStatus === 'verificado' ? nombreParticipante(pasajero.identity) : pasajero?.nombreGoogle) || pasajero?.name || 'Pasajero',
           passengerPhone: pasajero?.phone || '',
           passengerRating: pasajeroCalificacion,
           passengerProfilePhoto: pasajero?.profilePhoto || null,
@@ -1240,7 +1241,7 @@ const obtenerViajeSolicitudes = async (solicitud, respuesta) => {
       {
         model: Usuario,
         as: 'passenger',
-          attributes: ['id', 'name', 'phone', 'profilePhoto'],
+          attributes: ['id', 'name', 'nombreGoogle', 'phone', 'profilePhoto'],
           include: [identidadConNombre]
       }],
 
@@ -1279,7 +1280,7 @@ const obtenerViajeSolicitudes = async (solicitud, respuesta) => {
     const viajeSolicitudes = visibleViajes.map((viaje, indice) => {
       const transformado = {
         rideId: viaje.id,
-        passengerName: nombreParticipante(viaje.passenger?.identity) || viaje.passenger?.name || 'Pasajero',
+        passengerName: (viaje.passenger?.identity?.verificationStatus === 'verificado' ? nombreParticipante(viaje.passenger.identity) : viaje.passenger?.nombreGoogle) || viaje.passenger?.name || 'Pasajero',
         passengerPhone: viaje.passenger?.phone || '',
         passengerRating: pasajeroCalificacionesMapa[viaje.passengerId] ?? 5,
         passengerProfilePhoto: viaje.passenger?.profilePhoto || null,
@@ -1465,7 +1466,7 @@ const pasajeroListo = async (solicitud, respuesta) => {
   try {
     const { rideId: viajeId } = solicitud.params;
 
-    // UPDATE: marcar al pasajero como listo
+    // Confirmar una sola vez, incluso ante reintentos simultáneos.
     const [actualizado] = await Viaje.update(
       {
         passengerReadyAt: new Date()
@@ -1473,26 +1474,11 @@ const pasajeroListo = async (solicitud, respuesta) => {
       {
         where: {
           id: viajeId,
-          status: 'llegado' // Solo se puede marcar si ya llegó el conductor
+          status: 'llegado', // Solo se puede marcar si ya llegó el conductor
+          passengerReadyAt: null
         }
       }
     );
-
-    if (actualizado === 0) {
-      // Verificar si el viaje existe pero no está en estado 'llegado'
-      const ride = await Viaje.findByPk(viajeId);
-      if (!ride) {
-        return respuesta.status(404).json({
-          error: 'Viaje no encontrado'
-        });
-      }
-
-      return respuesta.status(400).json({
-        error:
-        'El viaje debe estar en estado "llegado" para marcar al pasajero como listo',
-        currentStatus: ride.status
-      });
-    }
 
     // Recuperar el viaje actualizado
     const viaje = await Viaje.findByPk(viajeId, {
@@ -1517,6 +1503,17 @@ const pasajeroListo = async (solicitud, respuesta) => {
 
     });
 
+    if (!viaje) {
+      return respuesta.status(404).json({ error: 'Viaje no encontrado' });
+    }
+
+    if (actualizado === 0 && !viaje.passengerReadyAt) {
+      return respuesta.status(400).json({
+        error: 'El viaje debe estar en estado "llegado" para marcar al pasajero como listo',
+        currentStatus: viaje.status
+      });
+    }
+
     console.log('🟢 [passengerReady] Pasajero está listo:', {
       id: viaje.id,
       status: viaje.status,
@@ -1525,7 +1522,7 @@ const pasajeroListo = async (solicitud, respuesta) => {
 
     // 🔌 Socket: notificar que pasajero está listo
     try {
-      obtenerIo().to(`ride:${viaje.id}`).emit('ride:status:changed', {
+      if (actualizado > 0) obtenerIo().to(`ride:${viaje.id}`).emit('ride:status:changed', {
         rideId: viaje.id,
         status: 'passenger_ready',
         timestamp: new Date().toISOString()
@@ -1667,7 +1664,7 @@ const enviarContraOferta = async (solicitud, respuesta) => {
       {
         model: Usuario,
         as: 'user',
-        attributes: ['id', 'name', 'phone', 'profilePhoto']
+        attributes: ['id', 'name', 'nombreGoogle', 'phone', 'profilePhoto']
       },
       {
         model: Vehiculo,
@@ -1900,7 +1897,7 @@ const obtenerContraOfertas = async (solicitud, respuesta) => {
         {
           model: Usuario,
           as: 'user',
-          attributes: ['id', 'name', 'phone', 'profilePhoto']
+          attributes: ['id', 'name', 'nombreGoogle', 'phone', 'profilePhoto']
         },
         {
           model: Vehiculo,

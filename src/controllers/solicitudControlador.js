@@ -1,5 +1,6 @@
 const { origenesAdjuntos } = require('../services/documentosRepositorio');
 const { saveMetadata } = require('../services/solicitudDocumentos');
+const { TIPOS_CI_PROPIETARIO, requiereCiPropietario } = require('../services/ciPropietario');
 // backend/src/controllers/solicitudControlador.js
 const ConductorSolicitud = require("../models/ConductorSolicitud");
 const ConductorDomicilio = require("../models/ConductorDomicilio");
@@ -17,7 +18,7 @@ const { recorteParaOcr, recorteAFotograma } = require("../services/documentoReco
 const { CONDUCTOR_OCR_DOCUMENTOS: CONDUCTOR_OCR_DOCUMENTS, guardarImagenesConductor } = require("../services/conductorOcrImage");
 
 const REQUERIDO_CONDUCTOR_DOCUMENTS = [
-'licenseFront', 'licenseBack', 'ticPhoto',
+'licenseFront', 'licenseBack',
 'antecedentsPhoto', 'carFront', 'carBack',
 'soatPhoto', 'ruatPhoto',
 'domicileProof'];
@@ -114,14 +115,17 @@ const procesarConductorSolicitudOcr = async (solicitudId) => {
   activoOcrSolicitudes.add(solicitudId);
   try {
     const registros = await SolicitudArchivo.findAll({ where: { requestId: solicitudId } });
+    const previo = await require('../services/solicitudDocumentos').readMetadata(solicitudId);
     const archivos = {};
     for (const registro of registros) {
       if (!CONDUCTOR_OCR_DOCUMENTS.has(registro.fileType)) continue;
+      if (previo.metadata.ocr[registro.fileType]?.text) continue;
       archivos[registro.fileType] = [{
         path: ruta.join(__dirname, '../uploads/drivers', ruta.basename(registro.filename))
       }];
     }
-    const {ocr, fallido} = await leerEnviadoDocumentos(archivos);
+    const {ocr: lecturas, fallido} = await leerEnviadoDocumentos(archivos);
+    const ocr = { ...previo.metadata.ocr, ...lecturas };
     const patch = {
       ...metadatosDesdeOcr(ocr),
       ocr,
@@ -237,7 +241,10 @@ const extraerDocumento = async (solicitud, respuesta) => {
       );
     }
 
+    const identidadPropietario = documentoTipo === 'ruatPhoto'
+      ? await UsuarioIdentidad.findOne({ where: { userId: solicitud.user.id } }) : null;
     respuesta.json({
+      ...(documentoTipo === 'ruatPhoto' ? { requiereCiPropietario: requiereCiPropietario(campos, identidadPropietario) } : {}),
       documentType: documentoTipo,
       fields: campos,
       rawText: brutoTexto,
@@ -307,11 +314,21 @@ const registrarConductor = async (solicitud, respuesta) => {
       });
       if (existente) throw Object.assign(new Error('Ya tienes una solicitud de conductor.'), { status: 409 });
       await guardarImagenesConductor(solicitud.files, solicitud.body);
+      const { ocr: ruatLeido, fallido: ruatFallido } = await leerEnviadoDocumentos({ ruatPhoto: solicitud.files.ruatPhoto });
+      if (ruatFallido) throw Object.assign(new Error('No se pudo leer el propietario del RUAT. Intenta nuevamente.'), { status: 503 });
+      if (!ruatLeido.ruatPhoto?.fields?.vehicleOwnerCi) {
+        throw Object.assign(new Error('No se pudo leer el CI del propietario del RUAT. Toma una foto más clara.'), { status: 422 });
+      }
+      if ((requiereCiPropietario(ruatLeido.ruatPhoto.fields, identidad) || TIPOS_CI_PROPIETARIO.some(tipo => solicitud.files?.[tipo]?.[0])) &&
+          TIPOS_CI_PROPIETARIO.some(tipo => !solicitud.files?.[tipo]?.[0])) {
+        throw Object.assign(new Error('Sube ambas caras del CI de la persona propietaria que figura en el RUAT.'),
+          { status: 422, code: 'CI_PROPIETARIO_REQUERIDO' });
+      }
       const creadoSolicitud = await ConductorSolicitud.create({
         userId: usuarioId,
         version: 1,
         status: 'pendiente',
-        metadata: { ocr: {}, ocrProcessingStatus: 'pendiente' }
+        metadata: { ocr: ruatLeido, ocrProcessingStatus: 'pendiente' }
       }, { transaction: transaccion });
       await ConductorDomicilio.create({
         userId: usuarioId,
@@ -319,7 +336,8 @@ const registrarConductor = async (solicitud, respuesta) => {
         address: domicilioDireccion.trim(),
         location: { type: 'Point', coordinates: [Number(domicilioLongitud), Number(domicilioLatitud)] }
       }, { transaction: transaccion });
-      for (const campo of REQUERIDO_CONDUCTOR_DOCUMENTS) {
+      for (const campo of [...REQUERIDO_CONDUCTOR_DOCUMENTS,
+        ...['ticPhoto', ...TIPOS_CI_PROPIETARIO].filter(tipo => solicitud.files?.[tipo]?.[0])]) {
         const archivo = solicitud.files[campo][0];
         await SolicitudArchivo.create({
           requestId: creadoSolicitud.id,
@@ -347,7 +365,8 @@ const registrarConductor = async (solicitud, respuesta) => {
   } catch (error) {
     console.error('Error registering driver:', error);
     respuesta.status(error.status || 500).json({
-      error: 'Error al crear solicitud de conductor: ' + error.message
+      error: 'Error al crear solicitud de conductor: ' + error.message,
+      ...(error.code === 'CI_PROPIETARIO_REQUERIDO' ? { code: error.code, requiredDocuments: TIPOS_CI_PROPIETARIO } : {})
     });
   }
 };
@@ -479,6 +498,14 @@ const resubmitDocumentos = async (solicitud, respuesta) => {
       actualizadoMetadatos.ocrProcessedAt = new Date().toISOString();
     }
     actualizadoMetadatos.ocr = actualizadoOcr;
+    const identidadPropietario = await UsuarioIdentidad.findOne({ where: { userId: usuarioId } });
+    if (requiereCiPropietario(actualizadoOcr.ruatPhoto?.fields, identidadPropietario)) {
+      const existentes = await SolicitudArchivo.findAll({ where: { requestId: recienteSolicitud.id, status: 'verificado' } });
+      if (TIPOS_CI_PROPIETARIO.some(tipo => !solicitud.files?.[tipo]?.[0] && !existentes.some(archivo => archivo.fileType === tipo))) {
+        return respuesta.status(422).json({ error: 'Sube ambas caras del CI de la persona propietaria del RUAT.',
+          code: 'CI_PROPIETARIO_REQUERIDO', requiredDocuments: TIPOS_CI_PROPIETARIO });
+      }
+    }
     if (solicitud.files?.licenseFront?.[0] || solicitud.files?.licenseBack?.[0]) {
       const frontal = actualizadoOcr.licenseFront?.fields || {};
       Object.assign(actualizadoMetadatos, {

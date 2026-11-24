@@ -130,9 +130,76 @@ async function crearComisionConViajes(cantidad=1){
   return row.reload();
 }
 
+baseDatosTest('el RUAT de otra persona requiere y conserva ambas caras del CI del propietario para revisión', async t => {
+  const fs = require('node:fs/promises');
+  const path = require('node:path');
+  const { UsuarioIdentidad, ConductorSolicitud, SolicitudArchivo } = require('../../models');
+  const controlador = require('../../controllers/solicitudControlador');
+  const revision = require('../../controllers/conductorRevisionControlador');
+  await UsuarioIdentidad.create({ userId: pasajero, firstNames: 'Ana', ciNumber: '12345678',
+    birthDate: '1990-01-01', verificationStatus: 'verificado' });
+  const tipos = ['licenseFront', 'licenseBack', 'ticPhoto', 'antecedentsPhoto', 'ruatPhoto', 'soatPhoto',
+    'carFront', 'carBack', 'domicileProof'];
+  tipos.splice(tipos.indexOf('ticPhoto'), 1);
+  const directorio = await fs.mkdtemp(path.join(require('node:os').tmpdir(), 'ci-propietario-'));
+  t.after(() => fs.rm(directorio, { recursive: true, force: true }));
+  const imagen = await require('sharp')({ create: { width: 100, height: 100, channels: 3, background: '#ffffff' } }).png().toBuffer();
+  t.mock.method(require('../servicioOcr'), 'extraerDocumento', async (_buffer, tipo) => ({
+    fields: tipo === 'ruatPhoto' ? { vehicleOwnerCi: '87654321' } : {},
+    rawText: tipo === 'ownerCiFront'
+      ? 'CEDULA DE IDENTIDAD\nNOMBRES ANA\nAPELLIDOS ROJAS\nN° 87654321\nFECHA DE NACIMIENTO 01/01/1990' : 'Lectura de prueba',
+    missing: []
+  }));
+  const inmediato = global.setImmediate;
+  t.mock.method(global, 'setImmediate', (fn, ...args) =>
+    fn.toString().includes('procesarConductorSolicitudOcr') ? undefined : inmediato(fn, ...args));
+  const respuesta = () => ({ codigo: 200,
+    status(codigo) { this.codigo = codigo; return this; },
+    json(datos) { this.datos = datos; return this; } });
+  const registrar = async propietarios => {
+    const archivos = {};
+    const campos = [...tipos, ...propietarios];
+    for (const tipo of campos) {
+      const filename = aleatorioUUID() + '.png';
+      const destino = path.join(directorio, filename);
+      await fs.writeFile(destino, imagen);
+      archivos[tipo] = [{ filename, path: destino, mimetype: 'image/png', size: imagen.length }];
+    }
+    const resultado = respuesta();
+    await controlador.registrarConductor({ user: { id: pasajero }, files: archivos, body: {
+      ...Object.fromEntries(campos.map(tipo => [tipo + 'Origen', 'captura_camara'])),
+      domicileAddress: 'Avenida de prueba 123', domicileLatitude: -16.5, domicileLongitude: -68.15
+    } }, resultado);
+    return resultado;
+  };
+  const incompleta = await registrar([]);
+  comprobar.equal(incompleta.codigo, 422);
+  comprobar.equal(incompleta.datos.code, 'CI_PROPIETARIO_REQUERIDO');
+  comprobar.equal(await ConductorSolicitud.count({ where: { userId: pasajero } }), 0);
+  const completa = await registrar(['ownerCiFront', 'ownerCiBack']);
+  comprobar.equal(completa.codigo, 201);
+  const id = completa.datos.request.id;
+  comprobar.equal(await SolicitudArchivo.count({ where: { requestId: id, fileType: 'ticPhoto' } }), 0);
+  comprobar.equal(await SolicitudArchivo.count({ where: { requestId: id, fileType: ['ownerCiFront', 'ownerCiBack'] } }), 2);
+  // El worker lee los documentos guardados sin volver a leer el RUAT ya comprobado.
+  const leerArchivo = fs.readFile;
+  t.mock.method(fs, 'readFile', async ruta => typeof ruta === 'string' && ruta.includes('uploads') ? imagen : leerArchivo(ruta));
+  await controlador.reanudarPendienteConductorOcr();
+  const solicitud = await ConductorSolicitud.findByPk(id);
+  comprobar.equal(solicitud.metadata.ocr.ownerCiFront.fields.ciNumber, '87654321');
+  const resultado = respuesta();
+  await revision.aprobarConductor({ user: { id: segundoPasajero }, params: { requestId: id },
+    body: { verifiedDocuments: tipos } }, resultado);
+  comprobar.equal(resultado.codigo, 400);
+  comprobar.match(resultado.datos.error, /CI del propietario/);
+});
+
 baseDatosTest('el perfil de conductor se crea únicamente al aprobar una solicitud y la aprobación es atómica', async t => {
   const { Conductor, ConductorSolicitud, Vehiculo, UsuarioIdentidad, SolicitudArchivo } = require('../../models');
   const registro = require('../../controllers/solicitudControlador');
+  t.mock.method(require('../servicioOcr'), 'extraerDocumento', async () => ({
+    fields: { vehicleOwnerCi: '12345678' }, rawText: 'RUAT de prueba', missing: []
+  }));
   const revision = require('../../controllers/conductorRevisionControlador');
   const legado = require('../../controllers/conductorControlador');
   const respuesta = () => ({ codigo: 200, status(codigo) { this.codigo = codigo; return this; }, json(datos) { this.datos = datos; return this; } });
@@ -686,6 +753,36 @@ baseDatosTest('recupera el viaje confirmado o la cancelación del último viaje 
   comprobar.equal(canceladoPorPasajero.cancelledBy, 'pasajero');
 });
 
+baseDatosTest('PU-05: vigencia de oferta antes, en y después del vencimiento', async t => {
+  const controlador = require('../../controllers/viajeControlador');
+  const { ViajeOferta } = require('../../models');
+  const instante = Date.parse('2030-01-01T12:00:00.000Z');
+  const viaje = await Viaje.create({
+    passengerId: pasajero, requestMode: 'negociacion', status: 'solicitado',
+    expiresAt: new Date('2030-01-02T12:00:00.000Z'),
+    pickupLocation: { type: 'Point', coordinates: [-68.15, -16.5] },
+    dropoffLocation: { type: 'Point', coordinates: [-68.15, -16.52] },
+    pickup_address: 'Recogida', dropoff_address: 'Destino', totalFare: 14, finalFare: 14,
+    distance: 1000, duration: 300
+  });
+  const oferta = await ViajeOferta.create({
+    ride_id: viaje.id, driver_id: cercanoConductor, offered_price: 16,
+    expires_at: new Date(instante)
+  });
+  t.mock.timers.enable({ apis: ['Date'], now: instante });
+  async function aceptar() {
+    const respuesta = { codigo: 200, status(codigo) { this.codigo = codigo; return this; }, json(datos) { this.datos = datos; return this; } };
+    await controlador.aceptarContraoferta({ user: { id: pasajero }, params: { rideId: viaje.id }, body: { offerId: oferta.id } }, respuesta);
+    return respuesta;
+  }
+  comprobar.equal((await aceptar()).codigo, 409, 'en el instante de vencimiento');
+  t.mock.timers.setTime(instante + 1);
+  comprobar.equal((await aceptar()).codigo, 409, 'después del vencimiento');
+  t.mock.timers.setTime(instante - 1);
+  const vigente = await aceptar();
+  comprobar.equal(vigente.codigo, 200, JSON.stringify(vigente.datos));
+});
+
 baseDatosTest('publica contraofertas nuevas y actualizadas y retira la solicitud al cancelar', async () => {
   const controlador = require('../../controllers/viajeControlador');
   const { Conductor, UsuarioIdentidad } = require('../../models');
@@ -925,6 +1022,47 @@ baseDatosTest('la zona conserva el atributo id al consultar las columnas renombr
   });
   const [[zona]] = await db.query('SELECT * FROM get_service_area(ST_SetSRID(ST_MakePoint(0.5,0.5),4326))');
   comprobar.equal(zona.id, id);
+});
+
+baseDatosTest('identidad progresiva permite diez viajes y exige identidad para el undécimo y para conducir', async () => {
+  const { Usuario, UsuarioIdentidad } = require('../../models');
+  const validar = require('../../middleware/verificadoIdentidad');
+  const { accesoIdentidad } = require('../identidadAcceso');
+  await Usuario.update({ phoneVerified: true, nombreGoogle: 'Nombre Google' }, { where: { id: pasajero } });
+  const consultar = async baseUrl => {
+    const respuesta = {
+      codigo: 200, continua: false,
+      status(codigo) { this.codigo = codigo; return this; },
+      json(datos) { this.datos = datos; return this; }
+    };
+    await validar({ user: { id: pasajero }, baseUrl }, respuesta, () => { respuesta.continua = true; });
+    return respuesta;
+  };
+  const { construirUsuarioRespuestaObjeto } = require('../../controllers/autenticacionControlador');
+  const usuario = await Usuario.findByPk(pasajero);
+  comprobar.equal((await construirUsuarioRespuestaObjeto(usuario)).nombre, 'Nombre Google');
+  comprobar.equal((await consultar('/api/viajes')).continua, true);
+  comprobar.equal((await consultar('/api/solicitudes')).datos.code, 'IDENTIDAD_REQUERIDA');
+  for (const status of ['cancelado', 'vencido']) {
+    const reserva = await servicio.reservar(pasajero, entrada());
+    await Viaje.update({ status }, { where: { id: reserva.id } });
+  }
+  comprobar.equal((await accesoIdentidad(pasajero, false)).viajesCompletadosPasajero, 0);
+  for (let numero = 0; numero < 10; numero++) {
+    comprobar.equal((await consultar('/api/viajes')).continua, true);
+    const reserva = await servicio.reservar(pasajero, entrada());
+    await Viaje.update({ status: 'completado' }, { where: { id: reserva.id } });
+    if (numero === 7) comprobar.equal((await accesoIdentidad(pasajero, false)).recordarVerificacionIdentidad, true);
+  }
+  comprobar.equal((await accesoIdentidad(pasajero, false)).viajesCompletadosPasajero, 10);
+  comprobar.equal((await consultar('/api/viajes')).datos.code, 'IDENTIDAD_REQUERIDA');
+  await UsuarioIdentidad.create({
+    userId: pasajero, firstNames: 'NOMBRE COMPLETO', paternalSurname: 'PATERNO', maternalSurname: 'MATERNO',
+    ciNumber: '6543210', birthDate: '1990-01-01', verificationStatus: 'verificado'
+  });
+  comprobar.equal((await consultar('/api/viajes')).continua, true);
+  comprobar.equal((await consultar('/api/solicitudes')).continua, true);
+  comprobar.equal((await construirUsuarioRespuestaObjeto(usuario)).nombre, 'NOMBRE COMPLETO PATERNO MATERNO');
 });
 
 baseDatosTest('la corrección administrativa del CI valida los cambios y los audita', async () => {

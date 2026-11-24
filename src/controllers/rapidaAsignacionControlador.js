@@ -40,7 +40,7 @@ async function detalles(viaje, usuarioId) {
     order: [['sequence', 'ASC']]
   }),
   mostrarPasajero ? Usuario.findByPk(viaje.passengerId, {
-    attributes: ['id', 'profilePhoto'],
+    attributes: ['id', 'profilePhoto', 'nombreGoogle'],
     include: [{ association: 'identity', attributes: [...camposNombre, 'verificationStatus'], required: false }]
   }) : null,
   mostrarPasajero ? obtenerResumenCalificaciones(viaje.passengerId, 'pasajero') : null,
@@ -54,7 +54,7 @@ async function detalles(viaje, usuarioId) {
     stops: paradas,
     ...(pasajero && {
       passenger: {
-        name: nombreCompleto(pasajero.identity),
+        name: pasajero.identity?.verificationStatus === 'verificado' ? nombreCompleto(pasajero.identity) : pasajero.nombreGoogle,
         photo: pasajero.profilePhoto || null,
         verified: pasajero.identity?.verificationStatus === 'verificado',
         ...resumenPasajero

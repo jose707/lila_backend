@@ -25,6 +25,11 @@ async function readMetadata(id, t) {
     const type = row.tipo_documento,
       spec = types[type];
     if (row.estado_verificacion === 'rechazado') rejected.push(type);
+    if (require('./ciPropietario').TIPOS_CI_PROPIETARIO.includes(type)) {
+      ocr[type] = { fields: require('./ciPropietario').leerCiPropietario(row.texto_ocr || '', type),
+        text: row.texto_ocr || '', missing: [] };
+      continue;
+    }
     if (!spec) continue;
     const [detail] = await repo.select(`SELECT * FROM public.${spec.table} WHERE ${spec.primaryKey}=:id`, {
       id: row.id_documento

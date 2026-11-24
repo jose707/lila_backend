@@ -6,6 +6,44 @@ const { analizarLicencia: analizarLicencia, REQUERIDOS_POR_TIPO: REQUERIDOS_POR_
 const { camposRequeridosDocumento } = require('../servicioOcr');
 const { comprobarDigito } = require('../ciMrz');
 const { camposOcrPendientes } = require('../solicitudDocumentos');
+const { requiereCiPropietario, validarCiPropietario, leerCiPropietario } = require('../ciPropietario');
+
+test('el TIC ausente no bloquea la validación documental y el TIC adjunto sí se valida', () => {
+  const { validarDatosDocumentales } = require('../documentosCorreccionServicio');
+  const identidad = { ciNumber: '12345678', firstNames: 'Ana', paternalSurname: 'Paz', birthDate: '1990-01-01' };
+  const metadata = { vehicleType: 'taxi', ocr: {
+    licenseFront: { fields: { licenseNumber: '12345678', fullName: 'Ana Paz', birthDate: '01/01/1990',
+      issueDate: '01/01/2020', licenseExpiryDate: '01/01/2099' } },
+    licenseBack: { fields: { licenseNumber: '12345678' } },
+    ruatPhoto: { fields: { vehicleOwnerCi: '12345678', vehiclePlate: 'ABC123', vehicleBrand: 'Marca', vehicleModel: 'Modelo', vehicleYear: '2025' } },
+    soatPhoto: { fields: { soatExpiryDate: '01/01/2099', soatUse: 'PUBLICO' } }
+  } };
+  comprobar.deepEqual(validarDatosDocumentales(metadata, identidad), []);
+  metadata.ocr.ticPhoto = { fields: { fullName: 'Otra Persona', licenseNumber: '87654321' } };
+  comprobar.ok(validarDatosDocumentales(metadata, identidad).some(error => error.documento === 'ticPhoto'));
+  metadata.ocr.ticPhoto.fields = { fullName: 'Ana Paz', licenseNumber: '12345678' };
+  comprobar.deepEqual(validarDatosDocumentales(metadata, identidad), []);
+});
+
+test('RUAT de otro propietario exige su CI y comprueba ambas caras', () => {
+  const identidad = { ciNumber: '12345678' };
+  comprobar.equal(requiereCiPropietario({ vehicleOwnerCi: '12 345 678' }, identidad), false);
+  const metadata = { ocr: { ruatPhoto: { fields: { vehicleOwnerCi: '87654321' } } } };
+  comprobar.equal(requiereCiPropietario(metadata.ocr.ruatPhoto.fields, identidad), true);
+  comprobar.equal(validarCiPropietario(metadata, identidad).length, 2);
+  const numero = '87654321<', nacimiento = '900101', vencimiento = '300101';
+  const primera = ('I<BOL' + numero + comprobarDigito(numero)).padEnd(30, '<');
+  const segunda = (nacimiento + comprobarDigito(nacimiento) + 'F' + vencimiento +
+    comprobarDigito(vencimiento) + 'BOL').padEnd(29, '<');
+  const control = comprobarDigito(primera.slice(5) + segunda.slice(0, 7) + segunda.slice(8, 15) + segunda.slice(18));
+  const frente = 'ESTADO PLURINACIONAL DE BOLIVIA\nCEDULA DE IDENTIDAD\nNOMBRES ANA\nAPELLIDOS ROJAS PEREZ\nN° 87654321\nFECHA DE NACIMIENTO 01/01/1990';
+  const dorso = [primera, segunda + control, 'ROJAS<PEREZ<<ANA'.padEnd(30, '<')].join('\n');
+  metadata.ocr.ownerCiFront = { text: frente, fields: leerCiPropietario(frente, 'ownerCiFront') };
+  metadata.ocr.ownerCiBack = { text: dorso, fields: leerCiPropietario(dorso, 'ownerCiBack') };
+  comprobar.deepEqual(validarCiPropietario(metadata, identidad), []);
+  metadata.ocr.ownerCiFront.fields.ciNumber = '11111111';
+  comprobar.ok(validarCiPropietario(metadata, identidad).some(error => error.mensaje.includes('no coincide')));
+});
 
 test('licencia reciente: lee el nombre sin rótulo y las fechas con meses abreviados', () => {
   const texto = [

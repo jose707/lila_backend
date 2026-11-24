@@ -64,15 +64,17 @@ function validarDatosDocumentales(metadata, identidad) {
     agregar(['licenseFront'],'Licencia: el número falta o no coincide con el CI.');
   if (nombre(licencia.fullName) !== nombre(esperado)) agregar(['licenseFront'],'Licencia: el nombre no coincide con el CI.');
   if (fechaIso(licencia.birthDate) !== identidad?.birthDate) agregar(['licenseFront'],'Licencia: la fecha de nacimiento no coincide con el CI.');
-  if (!tic.fullName || nombre(tic.fullName) !== nombre(esperado)) agregar(['ticPhoto'],'TIC: el nombre falta o no coincide con el CI.');
-  if (tic.licenseNumber !== licencia.licenseNumber) agregar(['ticPhoto'],'TIC: el número de licencia no coincide con la licencia presentada.');
+  if (ocr.ticPhoto) {
+    if (!tic.fullName || nombre(tic.fullName) !== nombre(esperado)) agregar(['ticPhoto'],'TIC: el nombre falta o no coincide con el CI.');
+    if (tic.licenseNumber !== licencia.licenseNumber) agregar(['ticPhoto'],'TIC: el número de licencia no coincide con la licencia presentada.');
+  }
   if (!ruat.vehiclePlate || !ruat.vehicleBrand || !ruat.vehicleModel || !ruat.vehicleYear)
     agregar(['ruatPhoto'],'RUAT: faltan placa, marca, modelo o año del vehículo.');
   if (!opciones.vehicleType.includes(metadata.vehicleType)) agregar(['ruatPhoto'],'El tipo de vehículo no es válido.');
   if (!vigente(licencia.licenseExpiryDate)) agregar(['licenseFront'],'Licencia: la fecha de vencimiento falta, es inválida o está vencida.');
   if (!vigente(soat.soatExpiryDate)) agregar(['soatPhoto'],'SOAT: la fecha de vencimiento falta, es inválida o está vencida.');
   if (soat.soatUse !== 'PUBLICO') agregar(['soatPhoto'],'SOAT: el uso debe ser PUBLICO.');
-  return errores;
+  return [...errores, ...require('./ciPropietario').validarCiPropietario(metadata, identidad)];
 }
 
 function revision(campos) { return createHash('sha256').update(JSON.stringify(campos)).digest('hex'); }
