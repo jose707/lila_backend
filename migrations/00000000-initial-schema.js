@@ -952,37 +952,32 @@ module.exports = {
       );
     `);
 
-    // ─── Seed: conductor de prueba para el acceso de desarrollo ───────────────
+    // ─── Seed: conductores de prueba para el acceso de desarrollo ──────────────
     const testDriverPasswordHash = bcrypt.hashSync('Conductor123!', 10);
-    await q(`
-      INSERT INTO usuario (id_usuario, firebase_uid, telefono, correo, contrasena, rol, modo_actual, activo, telefono_verificado, creado_en, actualizado_en)
-      VALUES (
-        '00000000-0000-0000-0000-000000000002',
-        'test-driver-seed',
-        '+59179990001',
-        'conductor.prueba@linealila.test',
-        '${testDriverPasswordHash}',
-        'conductor',
-        'conductor',
-        true,
-        true,
-        NOW(),
-        NOW()
-      );
-      INSERT INTO conductor (id_conductor, id_usuario, estado, disponible, creado_en, actualizado_en)
-      VALUES (
-        '00000000-0000-0000-0000-000000000002',
-        '00000000-0000-0000-0000-000000000002',
-        'aprobado',
-        false,
-        NOW(),
-        NOW()
-      );
-      INSERT INTO vehiculo(id_vehiculo,id_conductor,estado) VALUES('00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-000000000002','activo');
-      INSERT INTO documento(id_documento,tipo_documento,ruta_archivo,origen_evidencia,estado_verificacion,verificado_en) VALUES('00000000-0000-0000-0000-000000000004','ruatPhoto','seed:ruat-prueba','semilla_desarrollo','verificado',NOW());
-      INSERT INTO documento_ruat(id_documento_ruat,marca,modelo,anio,color,placa,capacidad,tipo_vehiculo) VALUES('00000000-0000-0000-0000-000000000004','Prueba','Taxi','2020','Blanco','TEST-0001','4','taxi');
-      INSERT INTO vehiculo_documento(id_vehiculo,id_documento) VALUES('00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-000000000004');
-    `);
+    for (const conductorPrueba of [
+      { id: '00000000-0000-0000-0000-000000000002', vehiculoId: '00000000-0000-0000-0000-000000000003',
+        documentoId: '00000000-0000-0000-0000-000000000004', uid: 'test-driver-seed',
+        telefono: '+59179990001', correo: 'conductor.prueba@linealila.test', placa: 'TEST-0001' },
+      { id: '00000000-0000-0000-0000-000000000005', vehiculoId: '00000000-0000-0000-0000-000000000006',
+        documentoId: '00000000-0000-0000-0000-000000000007', uid: 'test-driver-seed-2',
+        telefono: '+59179990002', correo: 'conductor.prueba2@linealila.test', placa: 'TEST-0002' }
+    ]) {
+      await q(`
+        INSERT INTO usuario (id_usuario, firebase_uid, telefono, correo, contrasena, rol, modo_actual, activo, telefono_verificado, creado_en, actualizado_en)
+        VALUES ('${conductorPrueba.id}', '${conductorPrueba.uid}', '${conductorPrueba.telefono}',
+          '${conductorPrueba.correo}', '${testDriverPasswordHash}', 'conductor', 'conductor', true, true, NOW(), NOW());
+        INSERT INTO conductor (id_conductor, id_usuario, estado, disponible, creado_en, actualizado_en)
+        VALUES ('${conductorPrueba.id}', '${conductorPrueba.id}', 'aprobado', false, NOW(), NOW());
+        INSERT INTO vehiculo(id_vehiculo,id_conductor,estado)
+        VALUES('${conductorPrueba.vehiculoId}','${conductorPrueba.id}','activo');
+        INSERT INTO documento(id_documento,tipo_documento,ruta_archivo,origen_evidencia,estado_verificacion,verificado_en)
+        VALUES('${conductorPrueba.documentoId}','ruatPhoto','seed:ruat-prueba','semilla_desarrollo','verificado',NOW());
+        INSERT INTO documento_ruat(id_documento_ruat,marca,modelo,anio,color,placa,capacidad,tipo_vehiculo)
+        VALUES('${conductorPrueba.documentoId}','Prueba','Taxi','2020','Blanco','${conductorPrueba.placa}','4','taxi');
+        INSERT INTO vehiculo_documento(id_vehiculo,id_documento)
+        VALUES('${conductorPrueba.vehiculoId}','${conductorPrueba.documentoId}');
+      `);
+    }
     // Proyecciones de lectura para conservar los contratos del backend. No renombran tablas.
     const mapa = require('../src/config/nombres-columnas-por-tabla.json');
     const citar = nombre => '"' + nombre.replaceAll('"', '""') + '"';
