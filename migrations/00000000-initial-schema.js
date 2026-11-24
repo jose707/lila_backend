@@ -436,14 +436,6 @@ module.exports = {
     await q(`CREATE INDEX idx_viaje_estado       ON viaje(estado);`);
     await q(`CREATE INDEX idx_viaje_service_area ON viaje(id_zona_servicio);`);
 
-    await q(`CREATE TABLE asignacion_rapida_intento (
-      id_viaje UUID NOT NULL REFERENCES viaje(id_viaje) ON DELETE CASCADE,
-      id_conductor UUID NOT NULL REFERENCES conductor(id_conductor),
-      estado VARCHAR(12) NOT NULL CHECK (estado IN ('pendiente','aceptado','rechazado','vencido','cancelado')),
-      vence_en TIMESTAMPTZ NOT NULL,
-      PRIMARY KEY (id_viaje, id_conductor)
-    );`);
-
     // ─── RIDE OFFERS ──────────────────────────────────────────────────────────
     await q(`
       CREATE TABLE oferta_viaje (
@@ -480,10 +472,20 @@ module.exports = {
         IF NEW.estado IN ('pendiente', 'aceptado') THEN
           PERFORM 1 FROM conductor WHERE id_conductor = NEW.id_conductor FOR UPDATE;
           IF EXISTS (SELECT 1 FROM viaje WHERE id_viaje = NEW.id_viaje AND modo_solicitud = 'asignacion_rapida') THEN
-            RAISE EXCEPTION 'La asignación rápida no admite ofertas' USING ERRCODE = '23514';
+            IF NOT EXISTS (
+              SELECT 1 FROM viaje WHERE id_viaje = NEW.id_viaje AND id_conductor = NEW.id_conductor
+                AND estado = 'solicitado' AND eliminado_en IS NULL AND ROUND(tarifa_final::numeric, 2) = NEW.precio_ofertado
+                AND NEW.vence_en <= vence_en
+                AND (NEW.estado <> 'aceptado' OR NEW.vence_en > clock_timestamp())
+            ) OR EXISTS (
+              SELECT 1 FROM oferta_viaje WHERE id_viaje = NEW.id_viaje AND id_conductor = NEW.id_conductor
+                AND id_oferta_viaje <> NEW.id_oferta_viaje
+            ) THEN
+              RAISE EXCEPTION 'La oferta rápida no corresponde a la asignación vigente' USING ERRCODE = '23514';
+            END IF;
           END IF;
           IF EXISTS (
-            SELECT 1 FROM viaje WHERE id_conductor = NEW.id_conductor AND eliminado_en IS NULL
+            SELECT 1 FROM viaje WHERE id_conductor = NEW.id_conductor AND id_viaje <> NEW.id_viaje AND eliminado_en IS NULL
               AND (estado IN ('aceptado','llegado','en_curso') OR
                 (modo_solicitud = 'asignacion_rapida' AND estado = 'solicitado' AND vence_en > clock_timestamp()))
           ) THEN
@@ -1094,7 +1096,6 @@ module.exports = {
     await q(`DROP TABLE IF EXISTS calificacion                CASCADE;`);
     await q(`DROP TABLE IF EXISTS pago               CASCADE;`);
     await q(`DROP TABLE IF EXISTS oferta_viaje            CASCADE;`);
-    await q(`DROP TABLE IF EXISTS asignacion_rapida_intento CASCADE;`);
     await q(`DROP TABLE IF EXISTS viaje                  CASCADE;`);
     await q(`DROP TABLE IF EXISTS motivo_cancelacion   CASCADE;`);
     await q(`DROP TABLE IF EXISTS zona_servicio          CASCADE;`);

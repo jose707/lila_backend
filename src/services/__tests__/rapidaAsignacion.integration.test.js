@@ -1329,7 +1329,7 @@ baseDatosTest('termina la búsqueda al vencer el plazo sin conductores', async (
 });
 baseDatosTest('cada conductor tiene diez segundos y el rechazo busca otro sin repetir conductores', async () => {
   const viaje = await servicio.reservar(pasajero, entrada());
-  const [intentos] = await db.query('SELECT * FROM public.asignacion_rapida_intento WHERE id_viaje=:id',
+  const [intentos] = await db.query('SELECT * FROM public.oferta_viaje WHERE id_viaje=:id',
     { replacements: { id: viaje.id }, esquemaFisico: true });
   comprobar.ok(new Date(intentos[0].vence_en) - Date.now() > 8000);
   comprobar.ok(new Date(intentos[0].vence_en) - Date.now() <= 10000);
@@ -1340,13 +1340,13 @@ baseDatosTest('cada conductor tiene diez segundos y el rechazo busca otro sin re
   comprobar.equal(sinConductor.driverId, null);
   comprobar.equal(sinConductor.status, 'solicitado');
   comprobar.equal((await servicio.actual(pasajero)).driverId, null);
-  const [historial] = await db.query('SELECT estado FROM public.asignacion_rapida_intento WHERE id_viaje=:id',
+  const [historial] = await db.query('SELECT estado FROM public.oferta_viaje WHERE id_viaje=:id',
     { replacements: { id: viaje.id }, esquemaFisico: true });
   comprobar.deepEqual(historial.map(i => i.estado), ['rechazado', 'rechazado']);
 });
 baseDatosTest('una oferta vencida pasa al siguiente conductor y una respuesta tardía no acepta el viaje', async () => {
   const viaje = await servicio.reservar(pasajero, entrada());
-  await db.query("UPDATE public.asignacion_rapida_intento SET vence_en=clock_timestamp()-interval '1 second'",
+  await db.query("UPDATE public.oferta_viaje SET vence_en=clock_timestamp()-interval '1 second'",
     { esquemaFisico: true });
   const siguiente = await aceptarReserva(viaje);
   comprobar.equal(siguiente.status, 'solicitado');
@@ -1415,7 +1415,7 @@ baseDatosTest(
     );
   }
 );
-baseDatosTest('rechaza ofertas sobre asignación rápida', async () => {
+baseDatosTest('rechaza ofertas de otros conductores sobre asignación rápida', async () => {
   const viaje = await servicio.reservar(pasajero, entrada());
   await comprobar.rejects(
     db.query(
@@ -1428,6 +1428,52 @@ baseDatosTest('rechaza ofertas sobre asignación rápida', async () => {
     (error) => error.original?.code === '23514'
   );
 });
+baseDatosTest('las ofertas rápidas reutilizan oferta_viaje sin permitir cambios desde negociación', async () => {
+  const viaje = await servicio.reservar(pasajero, entrada());
+  const [[{ tabla }]] = await db.query("SELECT to_regclass('public.asignacion_rapida_intento') AS tabla", { esquemaFisico: true });
+  comprobar.equal(tabla, null);
+  const { ViajeOferta } = require('../../models');
+  const oferta = await ViajeOferta.findOne({ where: { ride_id: viaje.id, driver_id: viaje.driverId } });
+  comprobar.ok(oferta);
+  comprobar.equal(Number(oferta.offered_price), Number(viaje.finalFare));
+  comprobar.equal(oferta.status, 'pendiente');
+  const controlador = require('../../controllers/viajeOfertaControlador');
+  const respuesta = () => ({ codigo: 200, status(codigo) { this.codigo = codigo; return this; },
+    json(datos) { this.datos = datos; return this; } });
+  const usuario = { id: await usuarioConductor(viaje.driverId) };
+  for (const [accion, solicitud] of [
+    ['crearOferta', { body: { rideId: viaje.id, driverId: viaje.driverId, offeredPrice: 1, expiresAt: viaje.expiresAt } }],
+    ['actualizarEstadoOferta', { params: { id: oferta.id }, body: { status: 'aceptado' } }],
+    ['rechazarOferta', { params: { id: oferta.id } }],
+    ['eliminarOfertasPendientes', { params: { rideId: viaje.id } }],
+    ['obtenerOfertasViaje', { params: { rideId: viaje.id }, query: {} }]
+  ]) {
+    const res = respuesta();
+    await controlador[accion]({ ...solicitud, user: usuario }, res);
+    comprobar.equal(res.codigo, 409, accion + ': ' + JSON.stringify(res.datos));
+  }
+  comprobar.equal((await oferta.reload()).status, 'pendiente');
+  comprobar.equal((await viaje.reload()).status, 'solicitado');
+  await aceptarReserva(viaje);
+  comprobar.equal((await oferta.reload()).status, 'aceptado');
+});
+
+baseDatosTest('reservar un conductor vence sus ofertas de negociación sin vencer la oferta rápida', async () => {
+  const solicitud = entrada();
+  const valores = await servicio.reservar(segundoPasajero, solicitud);
+  await servicio.cancelarReserva(segundoPasajero, valores.id);
+  const puntos = { type: 'Point', coordinates: [-68.15, -16.5] };
+  const negociacion = await Viaje.create({ ...valores.toJSON(), id: aleatorioUUID(), requestKey: null,
+    requestMode: 'negociacion', status: 'solicitado', driverId: null, cancelledBy: null,
+    cancelledAt: null, pickupLocation: puntos, dropoffLocation: puntos });
+  const { ViajeOferta } = require('../../models');
+  const anterior = await ViajeOferta.create({ ride_id: negociacion.id, driver_id: cercanoConductor,
+    offered_price: 20, expires_at: new Date(Date.now() + 60000) });
+  const rapido = await servicio.reservar(pasajero, entrada());
+  comprobar.equal((await anterior.reload()).status, 'vencido');
+  comprobar.equal((await ViajeOferta.findOne({ where: { ride_id: rapido.id } })).status, 'pendiente');
+});
+
 baseDatosTest('vencimiento y cancelación liberan sin revivir la reserva', async () => {
   const viaje = await servicio.reservar(pasajero, entrada());
   await viaje.update({ expiresAt: new Date(Date.now() - 1000) });

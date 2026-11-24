@@ -17,7 +17,7 @@ const {
   validarPunto: validarPunto
 } = require("./rapidaAsignacionPolicy");
 
-const consultarIntentos = (sql, replacements, transaction) =>
+const consultarOfertas = (sql, replacements, transaction) =>
   sequelize.query(sql, { replacements, transaction, esquemaFisico: true });
 
 async function publicar(viaje, anteriorId) {
@@ -32,8 +32,8 @@ async function publicar(viaje, anteriorId) {
 }
 
 async function ofrecerSiguiente(viaje, transaccion) {
-  const [historial] = await consultarIntentos(
-    'SELECT id_conductor FROM public.asignacion_rapida_intento WHERE id_viaje = :id',
+  const [historial] = await consultarOfertas(
+    'SELECT id_conductor FROM public.oferta_viaje WHERE id_viaje = :id',
     { id: viaje.id }, transaccion);
   const omitidos = historial.map(intento => intento.id_conductor);
   const [candidatos] = await sequelize.query(
@@ -73,11 +73,11 @@ async function ofrecerSiguiente(viaje, transaccion) {
   if (vence.getTime() <= new Date(ahora).getTime()) return;
   await viaje.update({ driverId: conductor.id, pickupDistance: recogida.distance, pickupDuration: recogida.duration },
     { transaction: transaccion });
-  await consultarIntentos(
-    "INSERT INTO public.asignacion_rapida_intento(id_viaje,id_conductor,estado,vence_en) VALUES(:id,:conductor,'pendiente',:vence)",
-    { id: viaje.id, conductor: conductor.id, vence }, transaccion);
-  await sequelize.query("UPDATE oferta_viaje SET status = 'vencido' WHERE driver_id = :id AND status = 'pendiente'",
-    { replacements: { id: conductor.id }, transaction: transaccion });
+  await consultarOfertas(
+    "INSERT INTO public.oferta_viaje(id_viaje,id_conductor,precio_ofertado,estado,vence_en) VALUES(:id,:conductor,:tarifa,'pendiente',:vence)",
+    { id: viaje.id, conductor: conductor.id, tarifa: viaje.finalFare, vence }, transaccion);
+  await sequelize.query("UPDATE oferta_viaje SET status = 'vencido' WHERE driver_id = :id AND ride_id <> :viaje AND status = 'pendiente'",
+    { replacements: { id: conductor.id, viaje: viaje.id }, transaction: transaccion });
 }
 
 async function avanzarBusqueda(id, usuarioId, aceptar) {
@@ -95,8 +95,8 @@ async function avanzarBusqueda(id, usuarioId, aceptar) {
     if (actual.status !== 'solicitado') return actual;
     anteriorId = actual.driverId;
     const [[{ ahora }]] = await sequelize.query('SELECT clock_timestamp() AS ahora', { transaction: transaccion });
-    const [intentos] = await consultarIntentos(
-      "SELECT * FROM public.asignacion_rapida_intento WHERE id_viaje = :id AND id_conductor = :conductor AND estado = 'pendiente'",
+    const [intentos] = await consultarOfertas(
+      "SELECT * FROM public.oferta_viaje WHERE id_viaje = :id AND id_conductor = :conductor AND estado = 'pendiente'",
       { id, conductor: actual.driverId }, transaccion);
     const intento = intentos[0];
     const vencido = new Date(actual.expiresAt).getTime() <= new Date(ahora).getTime();
@@ -113,8 +113,8 @@ async function avanzarBusqueda(id, usuarioId, aceptar) {
           { replacements: { id: actual.driverId, maxAge: UBICACION_MAXIMO_ANTIGUEDAD_SEGUNDOS, lng: actual.pickupLocation.coordinates[0], lat: actual.pickupLocation.coordinates[1], radius: RADIO_METROS, vehicleType: actual.vehicle_type_requested, vence: intento.vence_en }, transaction: transaccion });
         if (!disponibles.length) estado = 'vencido';
       }
-      await consultarIntentos(
-        "UPDATE public.asignacion_rapida_intento SET estado = :estado WHERE id_viaje = :id AND estado = 'pendiente'",
+      await consultarOfertas(
+        "UPDATE public.oferta_viaje SET estado = :estado, actualizado_en = clock_timestamp() WHERE id_viaje = :id AND estado = 'pendiente'",
         { estado, id }, transaccion);
       if (estado === 'aceptado') {
         await actual.update({ status: 'aceptado', acceptedAt: ahora }, { transaction: transaccion });
@@ -328,8 +328,8 @@ async function cancelarReserva(usuarioId, id) {
     if (!actual || actual.requestMode !== 'asignacion_rapida') throw fallar(404, 'Solicitud no encontrada.');
     if (actual.passengerId !== usuarioId) throw fallar(403, 'Este viaje no te pertenece.');
     if (actual.status !== 'solicitado') return actual;
-    await consultarIntentos(
-      "UPDATE public.asignacion_rapida_intento SET estado = 'cancelado' WHERE id_viaje = :id AND estado = 'pendiente'",
+    await consultarOfertas(
+      "UPDATE public.oferta_viaje SET estado = 'cancelado', actualizado_en = clock_timestamp() WHERE id_viaje = :id AND estado = 'pendiente'",
       { id }, transaccion);
     return actual.update({ status: 'cancelado', cancelledBy: 'pasajero', cancelledAt: new Date() },
       { transaction: transaccion });

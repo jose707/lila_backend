@@ -66,6 +66,7 @@ enrutador.post(
 enrutador.get(
   '/:rideId/contraofertas',
   autenticacionIntermediario,
+  negociacionOnly,
   viajeControlador.obtenerContraofertas
 );
 enrutador.post(

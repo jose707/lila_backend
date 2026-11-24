@@ -48,7 +48,7 @@ async function detalles(viaje, usuarioId) {
   mostrarConductor ? obtenerResumenCalificaciones(viaje.driverId, 'conductor') : null]
   );
   const [intentos] = mostrarPasajero ? await require('../config/baseDatos').query(
-    "SELECT vence_en FROM public.asignacion_rapida_intento WHERE id_viaje = :id AND id_conductor = :conductor AND estado = 'pendiente'",
+    "SELECT vence_en FROM public.oferta_viaje WHERE id_viaje = :id AND id_conductor = :conductor AND estado = 'pendiente'",
     { replacements: { id: viaje.id, conductor: viaje.driverId }, esquemaFisico: true }
   ) : [[]];
   const datos = viaje.toJSON();

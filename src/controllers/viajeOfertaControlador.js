@@ -3,6 +3,12 @@ const { Viaje: Viaje, ViajeOferta: ViajeOferta, Conductor: Conductor, Usuario: U
 const sequelize = require("../config/baseDatos");
 const { Op: Operador } = require('sequelize');
 
+function esAsignacionRapida(viaje, respuesta) {
+  if (viaje?.requestMode !== 'asignacion_rapida') return false;
+  respuesta.status(409).json({ error: 'Responde la solicitud desde el flujo de asignación rápida.' });
+  return true;
+}
+
 /**
  * Calcula el rating promedio del conductor desde rides.
  * Retorna 5 si no tiene valoraciones (conductor nuevo).
@@ -51,6 +57,7 @@ exports.crearOferta = async (solicitud, respuesta) => {
       status(404).
       json({ success: false, message: 'Ride not found' });
     }
+    if (esAsignacionRapida(viaje, respuesta)) return;
     if (!['solicitado', 'ofertado'].includes(viaje.status)) {
       return respuesta.status(400).json({
         success: false,
@@ -184,6 +191,7 @@ exports.obtenerOfertaPorId = async (solicitud, respuesta) => {
         message: 'Offer not found'
       });
     }
+    if (esAsignacionRapida(await Viaje.findByPk(oferta.ride_id), respuesta)) return;
 
     return respuesta.status(200).json({
       success: true,
@@ -212,6 +220,7 @@ exports.obtenerOfertasViaje = async (solicitud, respuesta) => {
         message: 'Ride not found'
       });
     }
+    if (esAsignacionRapida(viaje, respuesta)) return;
 
     const condiciones = { ride_id: viajeId };
     if (estado) {
@@ -291,6 +300,7 @@ exports.obtenerOfertasConductor = async (solicitud, respuesta) => {
       {
         model: Viaje,
         as: 'ride',
+        where: { requestMode: 'negociacion' },
         attributes: [
         'id',
         'passengerId',
@@ -347,6 +357,7 @@ exports.actualizarEstadoOferta = async (solicitud, respuesta) => {
         message: 'Offer not found'
       });
     }
+    if (esAsignacionRapida(await Viaje.findByPk(oferta.ride_id), respuesta)) return;
 
     // If accepting offer, reject all other offers for the same ride
     if (estado === 'aceptado') {
@@ -406,6 +417,7 @@ exports.rechazarOferta = async (solicitud, respuesta) => {
         message: 'Offer not found'
       });
     }
+    if (esAsignacionRapida(await Viaje.findByPk(oferta.ride_id), respuesta)) return;
 
     oferta.status = 'rechazado';
     await oferta.save();
@@ -439,6 +451,7 @@ exports.eliminarOfertasPendientes = async (solicitud, respuesta) => {
         message: 'Ride not found'
       });
     }
+    if (esAsignacionRapida(viaje, respuesta)) return;
 
     // Delete all pending offers for this ride
     const eliminadoCantidad = await ViajeOferta.destroy({
