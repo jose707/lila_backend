@@ -60,4 +60,25 @@ async function obtenerViajeRuta(solicitud, respuesta) {
   }
 }
 
-module.exports = { obtenerViajeRuta: obtenerViajeRuta };
+async function obtenerRutaPrevia(solicitud, respuesta) {
+  const puntos = solicitud.body?.puntos;
+  if (!Array.isArray(puntos) || puntos.length < 2 || puntos.length > 10 ||
+    puntos.some(punto => !punto || !Number.isFinite(punto.latitude) || !Number.isFinite(punto.longitude) ||
+      Math.abs(punto.latitude) > 90 || Math.abs(punto.longitude) > 180)) {
+    return respuesta.status(400).json({ error: 'Selecciona un origen, un destino y hasta ocho paradas válidas.' });
+  }
+  try {
+    const ruta = await conduccionRutaDetalle(puntos);
+    if (!Number.isFinite(ruta.distance) || !Number.isFinite(ruta.duration)) {
+      return respuesta.status(503).json({ error: 'No se pudo calcular la distancia y duración del recorrido.' });
+    }
+    return respuesta.json(ruta);
+  } catch (error) {
+    return respuesta.status(error.status || 500).json({
+      error: error.status ? error.message : 'No se pudo calcular la ruta.',
+      code: error.code || 'ROUTING_UNAVAILABLE'
+    });
+  }
+}
+
+module.exports = { obtenerViajeRuta, obtenerRutaPrevia };

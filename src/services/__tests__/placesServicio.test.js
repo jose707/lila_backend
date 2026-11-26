@@ -190,3 +190,24 @@ test('ordena sugerencias por cercanía y separa la dirección sin el país', asy
     ['far', 'unknown', 'near']
   );
 });
+
+test('la geocodificación inversa usa Google y devuelve su dirección en español', async () => {
+  global.fetch = async url => {
+    const consulta = new URL(url);
+    comprobar.equal(consulta.origin + consulta.pathname, 'https://maps.googleapis.com/maps/api/geocode/json');
+    comprobar.equal(consulta.searchParams.get('latlng'), '-16.5,-68.15');
+    comprobar.equal(consulta.searchParams.get('language'), 'es');
+    return { ok: true, json: async () => ({ status: 'OK', results: [{ formatted_address: 'Calle de prueba, La Paz' }] }) };
+  };
+  comprobar.equal(await lugares.inversa({ latitude: -16.5, longitude: -68.15 }), 'Calle de prueba, La Paz');
+});
+
+test('la dirección inversa valida coordenadas y no inventa resultados si Google falla', async () => {
+  global.fetch = async () => { throw new Error('No debe consultar Google'); };
+  await comprobar.rejects(lugares.inversa({ latitude: 91, longitude: 0 }), e => e.status === 400);
+  await comprobar.rejects(lugares.inversa({ latitude: '1', longitude: 0 }), e => e.status === 400);
+  global.fetch = async () => ({ ok: true, json: async () => ({ status: 'ZERO_RESULTS', results: [] }) });
+  comprobar.equal(await lugares.inversa({ latitude: -16.5, longitude: -68.15 }), null);
+  global.fetch = async () => ({ ok: true, json: async () => ({ status: 'REQUEST_DENIED' }) });
+  await comprobar.rejects(lugares.inversa({ latitude: -16.5, longitude: -68.15 }), e => e.status === 502);
+});

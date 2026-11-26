@@ -7,7 +7,7 @@ enrutador.use((_Solicitud, respuesta, siguiente) => {
   respuesta.set('Cache-Control', 'no-store');
   siguiente();
 });
-for (const [accion, clave] of [['autocompletar', 'suggestions'], ['detalles', 'place']]) {
+for (const [accion, clave] of [['autocompletar', 'suggestions'], ['detalles', 'place'], ['inversa', 'direccion']]) {
   enrutador.post(`/${accion}`, async (solicitud, respuesta) => {
     try {
       respuesta.json({

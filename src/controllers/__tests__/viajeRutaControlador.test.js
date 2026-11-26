@@ -6,7 +6,7 @@ const Viaje = require("../../models/Viaje");
 const Conductor = require("../../models/Conductor");
 const ConductorUbicacion = require('../../models/ConductorUbicacion');
 const originalUbicacion = ConductorUbicacion.findByPk;
-const { obtenerViajeRuta: obtenerViajeRuta } = require("../viajeRutaControlador");
+const { obtenerViajeRuta, obtenerRutaPrevia } = require("../viajeRutaControlador");
 
 const originalBuscarViaje = Viaje.findByPk;
 const originalBuscarConductor = Conductor.findOne;
@@ -138,4 +138,34 @@ test('rechaza recalcular con una ubicación antigua', async () => {
   const res = respuesta();
   await obtenerViajeRuta({ params: { rideId: 'ride-1' }, query: { recalcular: '1' }, user: { id: 'pasajero' } }, res);
   comprobar.equal(res.code, 409);
+});
+
+test('la vista previa valida puntos antes de consultar Google', async () => {
+  global.fetch = async () => { throw new Error('No debe consultar Google'); };
+  for (const puntos of [null, [], [{ latitude: 0, longitude: 0 }], [{ latitude: 100, longitude: 0 }, {}],
+    Array.from({ length: 11 }, () => ({ latitude: 0, longitude: 0 }))]) {
+    const res = respuesta();
+    await obtenerRutaPrevia({ body: { puntos } }, res);
+    comprobar.equal(res.code, 400);
+  }
+});
+
+test('la vista previa obtiene distancia y tiempo de Google y mantiene las paradas ordenadas', async () => {
+  process.env.GOOGLE_MAPS_API_KEY = 'test-key';
+  global.fetch = async url => {
+    const consulta = new URL(url);
+    comprobar.equal(consulta.searchParams.get('waypoints'), '-16.601,-68.201');
+    return { ok: true, json: async () => ({ status: 'OK', routes: [{
+      overview_polyline: { points: 'ruta-previa-google' },
+      legs: [{ distance: { value: 1200 }, duration: { value: 180 } },
+        { distance: { value: 1300 }, duration: { value: 240 } }]
+    }] }) };
+  };
+  const res = respuesta();
+  await obtenerRutaPrevia({ body: { puntos: [
+    { latitude: -16.6, longitude: -68.2 }, { latitude: -16.601, longitude: -68.201 },
+    { latitude: -16.602, longitude: -68.202 }
+  ], distance: 1, duration: 1 } }, res);
+  comprobar.equal(res.code, 200);
+  comprobar.deepEqual(res.body, { polyline: 'ruta-previa-google', distance: 2500, duration: 420 });
 });

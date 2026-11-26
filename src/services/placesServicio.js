@@ -127,4 +127,27 @@ async function detalles({ placeId: lugarId, sessionToken: sesionToken }) {
     lon: String(datos.location.longitude)
   };
 }
-module.exports = { autocompletar, detalles: detalles };
+async function inversa({ latitude, longitude }) {
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude) ||
+    Math.abs(latitude) > 90 || Math.abs(longitude) > 180) {
+    throw fallar(400, 'Ubicación inválida.');
+  }
+  const clave = process.env.GOOGLE_MAPS_API_KEY;
+  if (!clave) throw fallar(503, 'La lectura de direcciones no está configurada.');
+  const parametros = new URLSearchParams({ latlng: latitude + ',' + longitude, language: 'es', key: clave });
+  try {
+    const respuesta = await fetch('https://maps.googleapis.com/maps/api/geocode/json?' + parametros, {
+      signal: AbortSignal.timeout(5000)
+    });
+    const datos = await respuesta.json();
+    if (!respuesta.ok || !['OK', 'ZERO_RESULTS'].includes(datos.status)) {
+      throw fallar(502, 'No se pudo consultar la dirección. Intenta nuevamente.');
+    }
+    const direccion = datos.results?.[0]?.formatted_address;
+    return typeof direccion === 'string' && direccion.trim() ? direccion.trim() : null;
+  } catch (error) {
+    if (error.status) throw error;
+    throw fallar(503, 'No se pudo conectar con la lectura de direcciones.');
+  }
+}
+module.exports = { autocompletar, detalles, inversa };

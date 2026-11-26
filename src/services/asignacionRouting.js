@@ -77,7 +77,10 @@ async function conduccionRutaDetalle(puntos) {
   const duration = duraciones.every(segundos => Number.isFinite(segundos) && segundos >= 0)
     ? duraciones.reduce((total, segundos) => total + segundos, 0)
     : null;
-  const detalle = { polyline: polilinea, duration };
+  const distancias = ruta.legs.map(tramo => tramo.distance?.value);
+  const distanciaValida = distancias.every(metros => Number.isFinite(metros) && metros >= 0);
+  const detalle = { polyline: polilinea, duration,
+    ...(distanciaValida && { distance: distancias.reduce((total, metros) => total + metros, 0) }) };
   geometriaCache.set(cacheClave, { detalle, expiresAt: Date.now() + 60 * 60 * 1000 });
   if (geometriaCache.size > 500) geometriaCache.delete(geometriaCache.keys().next().value);
   return detalle;
